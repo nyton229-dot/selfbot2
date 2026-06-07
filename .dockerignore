@@ -1,0 +1,12 @@
+.env
+.env.*
+.lpbot.pid
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
+user/
+.git/
+.gitignore

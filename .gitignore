@@ -1,0 +1,12 @@
+.env
+.lpbot.pid
+ai_access.json
+ai_models.json
+data/
+user/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+.idea/
