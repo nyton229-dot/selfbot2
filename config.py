@@ -18,7 +18,7 @@ def data_dir() -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    vk_user_token: str
+    vk_user_tokens: tuple[str, ...]
     ai_provider: str
     ai_api_key: str
     ai_base_url: str
@@ -81,10 +81,19 @@ def _resolve_ai_settings() -> tuple[str, str, str, str]:
     return provider, bothub_key, base_url.rstrip("/"), model
 
 
+def _load_vk_tokens() -> tuple[str, ...]:
+    tokens: list[str] = []
+    for key in ("VK_USER_TOKEN", "VK_USER_TOKEN_2"):
+        value = os.getenv(key, "").strip()
+        if value and value not in tokens:
+            tokens.append(value)
+    return tuple(tokens)
+
+
 def load_settings() -> Settings:
     _load_dotenv()
 
-    vk_user_token = os.getenv("VK_USER_TOKEN", "").strip()
+    vk_user_tokens = _load_vk_tokens()
     ai_provider, ai_api_key, ai_base_url, ai_model = _resolve_ai_settings()
     ai_vision_model = os.getenv("AI_VISION_MODEL", "claude-sonnet-4.6").strip()
     ai_whisper_model = os.getenv("AI_WHISPER_MODEL", "whisper-1").strip()
@@ -152,13 +161,13 @@ def load_settings() -> Settings:
         ),
     ).strip()
 
-    if not vk_user_token:
+    if not vk_user_tokens:
         raise RuntimeError(
             "Не задан VK_USER_TOKEN. Скопируйте .env.example в .env и заполните значения."
         )
 
     return Settings(
-        vk_user_token=vk_user_token,
+        vk_user_tokens=vk_user_tokens,
         ai_provider=ai_provider,
         ai_api_key=ai_api_key,
         ai_base_url=ai_base_url,

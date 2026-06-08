@@ -12,6 +12,20 @@ _MUTEX_NAME = "Local\\lpbot_vk_singleton"
 _mutex_handle: int | None = None
 
 
+def _skip_pid_lock() -> bool:
+    """В Docker/Bothost процесс всегда PID 1 — .lpbot.pid ломает перезапуск контейнера."""
+    if os.getenv("BOT_ID"):
+        return True
+    if Path("/.dockerenv").is_file():
+        return True
+    return os.getenv("LPBOT_SKIP_INSTANCE_LOCK", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -55,12 +69,16 @@ def acquire_instance_lock() -> None:
     if sys.platform == "win32":
         _acquire_windows_mutex()
 
+    if _skip_pid_lock():
+        return
+
+    current_pid = os.getpid()
     if LOCK_PATH.exists():
         try:
             pid = int(LOCK_PATH.read_text(encoding="utf-8").strip())
         except ValueError:
             pid = 0
-        if _process_alive(pid):
+        if pid != current_pid and _process_alive(pid):
             raise RuntimeError(
                 f"Бот уже запущен (PID {pid}). "
                 "Второй экземпляр создаёт лишнюю сессию VK и повышает риск бана. "
@@ -68,7 +86,7 @@ def acquire_instance_lock() -> None:
             )
         LOCK_PATH.unlink(missing_ok=True)
 
-    LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    LOCK_PATH.write_text(str(current_pid), encoding="utf-8")
 
 
 def release_instance_lock() -> None:

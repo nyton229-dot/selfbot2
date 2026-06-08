@@ -32,7 +32,7 @@ from ai_models import (
 )
 from ai_access import (
     AccessCommand,
-    get_access_store,
+    AiAccessStore,
     init_access_store,
     is_dov_list_command,
     mention_user_id_from_text,
@@ -266,7 +266,7 @@ def should_queue_access_event(event: Any) -> bool:
     return parse_access_command(text) is not None
 
 
-def should_queue_ai_event(event: Any) -> bool:
+def should_queue_ai_event(event: Any, access_store: AiAccessStore) -> bool:
     """
     В очередь попадают сообщения из бесед:
     - исходящие с префиксом «артем» (владелец);
@@ -285,7 +285,7 @@ def should_queue_ai_event(event: Any) -> bool:
         return True
 
     if event.to_me and not event.from_me:
-        return get_access_store().has_access(event.peer_id, event.user_id)
+        return access_store.has_access(event.peer_id, event.user_id)
 
     return False
 
@@ -294,6 +294,8 @@ def _handle_longpoll_event(
     event: Any,
     queue: asyncio.Queue[Any],
     loop: asyncio.AbstractEventLoop,
+    access_store: AiAccessStore,
+    account_id: str,
 ) -> None:
     if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
         return
@@ -303,7 +305,8 @@ def _handle_longpoll_event(
     videos = event_has_videos(event)
     if text_preview or photos or videos:
         logger.info(
-            "Событие беседа: chat_id=%s from_me=%s to_me=%s user_id=%s photos=%s videos=%s text=%r",
+            "Событие беседа [акк %s]: chat_id=%s from_me=%s to_me=%s user_id=%s photos=%s videos=%s text=%r",
+            account_id,
             event.chat_id,
             event.from_me,
             event.to_me,
@@ -330,10 +333,10 @@ def _handle_longpoll_event(
         kind = "dov"
     elif should_queue_access_event(event):
         kind = "access"
-    elif should_queue_ai_event(event):
+    elif should_queue_ai_event(event, access_store):
         kind = "ai"
     if kind:
-        logger.info("В очередь: %s chat_id=%s", kind, event.chat_id)
+        logger.info("В очередь [акк %s]: %s chat_id=%s", account_id, kind, event.chat_id)
         asyncio.run_coroutine_threadsafe(queue.put((kind, event)), loop)
 
 
@@ -342,6 +345,8 @@ def vk_listener_thread(
     preload_messages: bool,
     queue: asyncio.Queue[Any],
     loop: asyncio.AbstractEventLoop,
+    access_store: AiAccessStore,
+    account_id: str,
 ) -> None:
     """LongPoll в отдельном потоке с переподключением без перезапуска процесса."""
     backoff_sec = 5
@@ -349,10 +354,10 @@ def vk_listener_thread(
 
     while True:
         longpoll = VkLongPoll(vk_session, preload_messages=preload_messages)
-        logger.info("LongPoll-слушатель запущен, ожидаю сообщения в беседах...")
+        logger.info("LongPoll [акк %s] запущен, ожидаю сообщения в беседах...", account_id)
         try:
             for event in longpoll.listen():
-                _handle_longpoll_event(event, queue, loop)
+                _handle_longpoll_event(event, queue, loop, access_store, account_id)
             backoff_sec = 5
         except ApiError as error:
             if error.code in (5, 18):
@@ -378,29 +383,44 @@ def vk_listener_thread(
             backoff_sec = min(backoff_sec * 2, max_backoff_sec)
 
 
+def _account_store_path(base: str, account_id: str, multi_account: bool) -> Path:
+    if not multi_account or account_id == "1":
+        return data_dir() / f"{base}.json"
+    return data_dir() / f"{base}_{account_id}.json"
+
+
 class VkDmBot:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        vk_token: str,
+        account_id: str,
+        multi_account: bool,
+    ) -> None:
         self._settings = settings
+        self._account_id = account_id
         self._models = init_model_store(
-            data_dir() / "ai_models.json",
+            _account_store_path("ai_models", account_id, multi_account),
             settings.ai_model,
             settings.ai_vision_model,
         )
         self._ai = AiClient(settings, self._models)
 
-        self._vk_session = vk_api.VkApi(token=settings.vk_user_token)
+        self._vk_session = vk_api.VkApi(token=vk_token)
         self._vk = self._vk_session.get_api()
         self._longpoll_preload = settings.longpoll_preload
         self._owner_labels: set[str] = {"артем"}
         self._owner_names: tuple[str, ...] = ()
         self._my_user_id = self._init_owner_account()
         self._access = init_access_store(
-            data_dir() / "ai_access.json",
+            _account_store_path("ai_access", account_id, multi_account),
             self._my_user_id,
         )
         self._user_names: dict[int, str] = {}
         logger.info(
-            "AI: provider=%s text_model=%s vision_model=%s",
+            "Акк %s: AI provider=%s text_model=%s vision_model=%s",
+            account_id,
             settings.ai_provider,
             self._models.text_model,
             self._models.vision_model,
@@ -1042,8 +1062,10 @@ class VkDmBot:
                 self._longpoll_preload,
                 queue,
                 loop,
+                self._access,
+                self._account_id,
             ),
-            name="vk-longpoll",
+            name=f"vk-longpoll-{self._account_id}",
             daemon=True,
         )
         listener.start()
@@ -1074,8 +1096,18 @@ async def amain() -> None:
     acquire_instance_lock()
     atexit.register(release_instance_lock)
     settings = load_settings()
-    bot = VkDmBot(settings)
-    await bot.run()
+    multi_account = len(settings.vk_user_tokens) > 1
+    bots = [
+        VkDmBot(
+            settings,
+            vk_token=token,
+            account_id=str(index + 1),
+            multi_account=multi_account,
+        )
+        for index, token in enumerate(settings.vk_user_tokens)
+    ]
+    logger.info("Запуск %d VK-аккаунт(ов)", len(bots))
+    await asyncio.gather(*(bot.run() for bot in bots))
 
 
 def main() -> None:
