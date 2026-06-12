@@ -47,6 +47,14 @@ def _attachments_have_media(attachments: list[dict[str, Any]]) -> bool:
     return False
 
 
+def media_in_current_message(message_data: dict[str, Any] | None) -> bool:
+    """Фото/видео прикреплены к этому сообщению, а не только к reply."""
+    if not message_data:
+        return False
+    current = message_data.get("attachments")
+    return isinstance(current, list) and _attachments_have_media(current)
+
+
 def media_is_self_upload(message_data: dict[str, Any] | None) -> bool:
     """Медиа в текущем сообщении, а не только в reply."""
     if not message_data:

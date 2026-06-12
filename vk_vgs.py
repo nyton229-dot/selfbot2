@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -10,11 +9,9 @@ import subprocess
 import tempfile
 from typing import Any
 
-from vk_api.upload import VkUpload
-from vk_api.utils import get_random_id
-
 from ffmpeg_util import find_ffmpeg as _find_ffmpeg
 from vk_media import download_video_file, find_video_object
+from vk_voice import build_send_params, upload_audio_message
 
 logger = logging.getLogger(__name__)
 
@@ -72,62 +69,6 @@ def _extract_audio(input_path: str, output_path: str) -> None:
         raise LookupError("Голосовое получилось слишком большим — пришли видео покороче")
 
 
-def _extract_uploaded_doc(upload_result: Any) -> dict[str, Any]:
-    payload = upload_result
-    if isinstance(payload, list):
-        if not payload:
-            raise RuntimeError("VK вернул пустой ответ после загрузки голосового")
-        payload = payload[0]
-    if not isinstance(payload, dict):
-        raise RuntimeError("VK вернул неожиданный ответ после загрузки голосового")
-
-    for key in ("audio_message", "doc", "graffiti"):
-        doc = payload.get(key)
-        if isinstance(doc, dict) and doc.get("owner_id") is not None and doc.get("id") is not None:
-            return doc
-
-    if payload.get("owner_id") is not None and payload.get("id") is not None:
-        return payload
-
-    logger.error("Неожиданный ответ docs.save: %s", list(payload.keys()))
-    raise RuntimeError("VK не вернул документ после загрузки голосового")
-
-
-def _build_doc_attachment(doc: dict[str, Any]) -> str:
-    owner_id = doc["owner_id"]
-    doc_id = doc["id"]
-    access_key = doc.get("access_key") or ""
-    suffix = f"{owner_id}_{doc_id}"
-    if access_key:
-        suffix += f"_{access_key}"
-    return f"doc{suffix}"
-
-
-def _reply_params(peer_id: int, event: Any, attachment: str) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "peer_id": peer_id,
-        "message": "",
-        "random_id": get_random_id(),
-        "attachment": attachment,
-    }
-    message_data = getattr(event, "message_data", None)
-    if isinstance(message_data, dict):
-        raw_cmid = message_data.get("conversation_message_id")
-        if raw_cmid is not None:
-            params["forward"] = json.dumps(
-                {
-                    "peer_id": peer_id,
-                    "conversation_message_ids": [int(raw_cmid)],
-                    "is_reply": 1,
-                },
-                ensure_ascii=False,
-            )
-            return params
-    if getattr(event, "message_id", None):
-        params["reply_to"] = event.message_id
-    return params
-
-
 def process_vgs_command(
     vk_session: Any,
     vk: Any,
@@ -146,9 +87,6 @@ def process_vgs_command(
         audio_path = os.path.join(tmp_dir, "voice.ogg")
         _extract_audio(source_path, audio_path)
 
-        uploader = VkUpload(vk_session)
-        upload_result = uploader.audio_message(audio_path, peer_id=peer_id)
+        attachment = upload_audio_message(vk_session, peer_id, audio_path)
 
-    doc = _extract_uploaded_doc(upload_result)
-    attachment = _build_doc_attachment(doc)
-    vk.messages.send(**_reply_params(peer_id, event, attachment))
+    vk.messages.send(**build_send_params(peer_id, event, attachment=attachment))

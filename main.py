@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
+import os
 import logging
 import sys
 import threading
@@ -40,7 +41,7 @@ from ai_access import (
 )
 from ai_client import (
     AiClient,
-    sanitize_ai_reply,
+    format_bot_message,
     sanitize_media_context_for_owner,
     wants_photo_compare,
 )
@@ -61,7 +62,6 @@ from vk_info import format_ai_info, is_info_command
 from vk_weather import fetch_weather_report, is_weather_command, parse_city_name
 from vk_reply import (
     ReplyToUserContext,
-    ensure_leading_mention,
     format_user_mention,
     get_reply_message,
     mention_label,
@@ -69,9 +69,27 @@ from vk_reply import (
     reply_message_conversation_id,
     reply_message_text,
 )
+from tts_client import text_to_voice_file
+from tts_voices import (
+    apply_voice_command,
+    init_voice_store,
+    is_artem_voice_command,
+    is_voice_command,
+    parse_voice_command,
+    voice_label,
+)
+from vk_text_cmds import (
+    build_kratko_prompt,
+    build_spor_extra_instruction,
+    parse_kratko_command,
+    parse_spor_command,
+    split_prompt_flags,
+)
+from vk_voice import send_voice_message
 from vk_media import (
     count_photos,
     load_message_images,
+    media_in_current_message,
     media_is_self_upload,
     message_has_media,
     message_has_photos,
@@ -247,6 +265,15 @@ def should_queue_ii_event(event: Any) -> bool:
     return is_ii_command((event.text or "").strip())
 
 
+def should_queue_voice_event(event: Any) -> bool:
+    """Команда /голос — смена голоса озвучки, только от владельца."""
+    if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
+        return False
+    if not event.from_me:
+        return False
+    return is_voice_command((event.text or "").strip())
+
+
 def should_queue_dov_list_event(event: Any) -> bool:
     """Команда /дов — список участников с доступом к ИИ."""
     if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
@@ -330,6 +357,8 @@ def _handle_longpoll_event(
         kind = "info"
     elif should_queue_ii_event(event):
         kind = "ii"
+    elif should_queue_voice_event(event):
+        kind = "voice"
     elif should_queue_delete_event(event):
         kind = "delete"
     elif should_queue_dov_list_event(event):
@@ -408,6 +437,10 @@ class VkDmBot:
             settings.ai_model,
             settings.ai_vision_model,
         )
+        self._voices = init_voice_store(
+            _account_store_path("tts_voice", account_id, multi_account),
+            settings.ai_tts_voice,
+        )
         self._ai = AiClient(settings, self._models)
 
         self._vk_session = vk_api.VkApi(token=vk_token)
@@ -422,11 +455,12 @@ class VkDmBot:
         )
         self._user_names: dict[int, str] = {}
         logger.info(
-            "Акк %s: AI provider=%s text_model=%s vision_model=%s",
+            "Акк %s: AI provider=%s text_model=%s vision_model=%s tts_voice=%s",
             account_id,
             settings.ai_provider,
             self._models.text_model,
             self._models.vision_model,
+            voice_label(self._voices.voice_id),
         )
 
     def _init_owner_account(self) -> int:
@@ -554,7 +588,7 @@ class VkDmBot:
         reply_to_cmid: int | None = None,
     ) -> None:
         """Отправляет ответ в беседу с цитированием исходного сообщения."""
-        text = sanitize_ai_reply(text)
+        text = format_bot_message(text)
         base_params: dict[str, Any] = {
             "peer_id": peer_id,
             "message": text,
@@ -587,7 +621,7 @@ class VkDmBot:
         """Обычное сообщение в беседу без reply."""
         self._vk.messages.send(
             peer_id=peer_id,
-            message=sanitize_ai_reply(text),
+            message=format_bot_message(text),
             random_id=get_random_id(),
         )
 
@@ -596,6 +630,61 @@ class VkDmBot:
             self._vk.messages.setActivity(peer_id=peer_id, type="typing")
         except ApiError:
             logger.debug("Не удалось отправить typing peer_id=%s", peer_id)
+
+    def _delete_trigger_message(self, peer_id: int, event: Any) -> None:
+        """Удаляет исходящее «артем …» владельца из беседы."""
+        cmid = self._conversation_message_id(event)
+        if cmid is None:
+            logger.warning("Не удалось удалить триггер: нет conversation_message_id")
+            return
+        try:
+            self._vk.messages.delete(
+                peer_id=peer_id,
+                cmids=cmid,
+                delete_for_all=1,
+            )
+            logger.info("Удалено сообщение-триггер cmid=%s peer_id=%s", cmid, peer_id)
+        except ApiError as error:
+            logger.warning(
+                "Не удалось удалить триггер cmid=%s peer_id=%s: %s",
+                cmid,
+                peer_id,
+                error,
+            )
+
+    def _send_voice_reply(
+        self,
+        peer_id: int,
+        event: Any,
+        text: str,
+        *,
+        reply_to_cmid: int | None = None,
+    ) -> None:
+        ogg_path: str | None = None
+        try:
+            ogg_path, tts_provider = text_to_voice_file(
+                text,
+                api_key=self._settings.ai_api_key,
+                base_url=self._settings.ai_base_url,
+                model=self._settings.ai_tts_model,
+                voice=self._voices.voice_id,
+                tts_base_url=self._settings.ai_tts_base_url,
+            )
+            logger.info("Озвучка через %s", tts_provider)
+            send_voice_message(
+                self._vk,
+                self._vk_session,
+                peer_id,
+                event,
+                ogg_path,
+                reply_to_cmid=reply_to_cmid,
+            )
+        finally:
+            if ogg_path:
+                try:
+                    os.remove(ogg_path)
+                except OSError:
+                    logger.debug("Не удалось удалить временный TTS-файл %s", ogg_path)
 
     async def _handle_weather(self, event: Any) -> None:
         peer_id = event.peer_id
@@ -785,6 +874,18 @@ class VkDmBot:
 
         await asyncio.to_thread(self.reply, peer_id, report, event)
 
+    async def _handle_voice(self, event: Any, *, prompt: str | None = None) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        text = prompt if prompt is not None else (event.text or "").strip()
+        command = parse_voice_command(text)
+        if command is None:
+            return
+
+        logger.info("Обработка голоса chat_id=%s action=%s", chat_id, command.action)
+        report = apply_voice_command(command, self._voices)
+        await asyncio.to_thread(self.reply, peer_id, report, event)
+
     async def _handle_delete(self, event: Any) -> None:
         peer_id = event.peer_id
         chat_id = event.chat_id
@@ -887,12 +988,69 @@ class VkDmBot:
             logger.info("Пропуск (нет префикса %r) chat_id=%s: %r", TRIGGER_PREFIX, chat_id, text[:80])
             return
 
-        reply_cmd = parse_reply_to_user_command(prompt)
+        cleaned_prompt, want_tts = split_prompt_flags(prompt)
+        if is_artem_voice_command(cleaned_prompt):
+            if outgoing_trigger:
+                await self._handle_voice(event, prompt=cleaned_prompt)
+            else:
+                command = parse_voice_command(cleaned_prompt)
+                if command and command.action in ("show", "list"):
+                    report = apply_voice_command(command, self._voices)
+                else:
+                    report = "Менять голос может только владелец: /голос дмитрий"
+                await asyncio.to_thread(self.reply, peer_id, report, event)
+            return
+
+        kratko_cmd = parse_kratko_command(cleaned_prompt)
+        spor_cmd = parse_spor_command(cleaned_prompt)
+        reply_cmd = parse_reply_to_user_command(cleaned_prompt)
         reply_to_user: ReplyToUserContext | None = None
         reply_to_cmid: int | None = None
-        ai_prompt = prompt
+        delete_owner_trigger = False
+        ai_prompt = cleaned_prompt
 
-        if reply_cmd is not None:
+        if kratko_cmd is not None:
+            reply_msg = get_reply_message(message_data)
+            if reply_msg is None:
+                logger.info("Кратко без reply_message chat_id=%s", chat_id)
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    "Ответь на сообщение и напиши «артем кратко».",
+                    event,
+                )
+                return
+            ai_prompt = build_kratko_prompt(
+                reply_message_text(reply_msg),
+                kratko_cmd.extra,
+            )
+            logger.info("Режим кратко chat_id=%s source=%r", chat_id, reply_message_text(reply_msg)[:80])
+        elif spor_cmd is not None:
+            reply_to_user = self._build_reply_to_user_context(
+                event,
+                message_data,
+                build_spor_extra_instruction(spor_cmd.extra),
+            )
+            if reply_to_user is None:
+                logger.info("Спорь без reply_message chat_id=%s", chat_id)
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    "Сначала ответь (reply) на его сообщение, потом «артем спорь».",
+                    event,
+                )
+                return
+            reply_to_cmid = reply_to_user.reply_cmid
+            ai_prompt = spor_cmd.extra or "спорь с ним — жёстко, не соглашайся"
+            want_tts = True
+            logger.info(
+                "Режим спорь chat_id=%s target=%s cmid=%s text=%r",
+                chat_id,
+                reply_to_user.target_name,
+                reply_to_cmid,
+                reply_to_user.replied_text[:80],
+            )
+        elif reply_cmd is not None:
             reply_to_user = self._build_reply_to_user_context(
                 event,
                 message_data,
@@ -916,6 +1074,8 @@ class VkDmBot:
                 reply_to_cmid,
                 reply_to_user.replied_text[:80],
             )
+            want_tts = True
+            delete_owner_trigger = outgoing_trigger
 
         if outgoing_trigger:
             logger.info("Исходящий триггер в беседе chat_id=%s: %r", chat_id, text[:120])
@@ -935,10 +1095,15 @@ class VkDmBot:
                 text[:120],
             )
 
+        if delete_owner_trigger:
+            await asyncio.to_thread(self._delete_trigger_message, peer_id, event)
+
         try:
             await asyncio.to_thread(self._set_typing, peer_id)
 
-            owner_self_media = outgoing_trigger and media_is_self_upload(message_data)
+            owner_self_media = outgoing_trigger and (
+                media_in_current_message(message_data) or media_is_self_upload(message_data)
+            )
             need_roast = outgoing_trigger and not owner_self_media and reply_to_user is None
             need_transcript = has_videos and should_transcribe_video(
                 ai_prompt,
@@ -1027,26 +1192,55 @@ class VkDmBot:
                     video_transcript=video_transcript,
                     reply_to_user=reply_to_user,
                 )
-                if reply_to_user is not None:
-                    reply = ensure_leading_mention(reply, reply_to_user.target_mention)
         except Exception:
             logger.exception("Ошибка AI API для user_id=%s", user_id)
             reply = "Сейчас не отвечаю — не трать моё и своё время."
 
         try:
-            await asyncio.to_thread(
-                self.reply,
-                peer_id,
-                reply,
-                event,
-                reply_to_cmid=reply_to_cmid,
-            )
-            logger.info(
-                "Reply отправлен в беседу chat_id=%s (%d символов)%s",
-                chat_id,
-                len(reply),
-                f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
-            )
+            if want_tts:
+                try:
+                    await asyncio.to_thread(
+                        self._send_voice_reply,
+                        peer_id,
+                        event,
+                        reply,
+                        reply_to_cmid=reply_to_cmid,
+                    )
+                    logger.info(
+                        "Голосовой ответ отправлен в беседу chat_id=%s (%d символов)%s",
+                        chat_id,
+                        len(reply),
+                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                    )
+                except Exception:
+                    logger.exception("TTS не сработал chat_id=%s, отправляю текстом", chat_id)
+                    await asyncio.to_thread(
+                        self.reply,
+                        peer_id,
+                        reply,
+                        event,
+                        reply_to_cmid=reply_to_cmid,
+                    )
+                    logger.info(
+                        "Reply отправлен в беседу chat_id=%s (%d символов)%s",
+                        chat_id,
+                        len(reply),
+                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                    )
+            else:
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    reply,
+                    event,
+                    reply_to_cmid=reply_to_cmid,
+                )
+                logger.info(
+                    "Reply отправлен в беседу chat_id=%s (%d символов)%s",
+                    chat_id,
+                    len(reply),
+                    f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                )
             if not outgoing_trigger and user_id != self._my_user_id:
                 left = self._access.consume(peer_id, user_id)
                 if left is not None and left == 0:
@@ -1085,6 +1279,8 @@ class VkDmBot:
                 await self._handle_info(event)
             elif kind == "ii":
                 await self._handle_ii(event)
+            elif kind == "voice":
+                await self._handle_voice(event)
             elif kind == "delete":
                 await self._handle_delete(event)
             elif kind == "dov":

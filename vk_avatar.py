@@ -16,6 +16,8 @@ from vk_api.exceptions import ApiError
 from vk_api.upload import VkUpload
 from vk_api.utils import get_random_id
 
+from ai_client import format_bot_message
+
 logger = logging.getLogger(__name__)
 
 AVA_COMMAND = "/ава"
@@ -263,8 +265,9 @@ def send_avatar_reply(
     event: Any,
     payload: AvatarPayload,
 ) -> None:
+    caption = format_bot_message(payload.caption)
     if payload.attachment:
-        vk.messages.send(**_reply_params(peer_id, event, payload.caption, payload.attachment))
+        vk.messages.send(**_reply_params(peer_id, event, caption, payload.attachment))
         return
 
     if not payload.image_url:
@@ -291,14 +294,14 @@ def send_avatar_reply(
         )
         doc = document["doc"]
         attachment = f"doc{doc['owner_id']}_{doc['id']}"
-        vk.messages.send(**_reply_params(peer_id, event, payload.caption, attachment))
+        vk.messages.send(**_reply_params(peer_id, event, caption, attachment))
     except ApiError:
         logger.exception("Не удалось загрузить файл, отправляю ссылку peer_id=%s", peer_id)
         vk.messages.send(
             **_reply_params(
                 peer_id,
                 event,
-                f"{payload.caption}\n{payload.image_url}",
+                f"{caption}\n{payload.image_url}",
                 None,
             )
         )

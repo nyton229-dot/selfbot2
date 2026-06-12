@@ -2,6 +2,7 @@
 .lpbot.pid
 ai_access.json
 ai_models.json
+tts_voice.json
 data/
 user/
 __pycache__/

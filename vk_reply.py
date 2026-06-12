@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+_VK_USER_MENTION_RE = re.compile(r"\[id(\d+)\|([^\]]+)\]", re.IGNORECASE)
+
 _REPLY_CMD_RE = re.compile(
     r"^(?:ответь|reply)\s+"
     r"(?:"
@@ -99,10 +101,55 @@ def mention_label(full_name: str, user_id: int) -> str:
     return first
 
 
-def ensure_leading_mention(text: str, mention: str) -> str:
-    if mention.casefold() in text.casefold():
-        return text
-    label = mention.split("|", 1)[-1].rstrip("]")
-    if label and len(label) >= 2 and label.casefold() in text[: max(len(label) + 8, 20)].casefold():
-        return text
-    return f"{mention}, {text.lstrip()}"
+def strip_vk_user_mentions(text: str) -> str:
+    """Убирает [id123|Имя] целиком."""
+    cleaned = _VK_USER_MENTION_RE.sub("", text)
+    cleaned = re.sub(r" +", " ", cleaned)
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r"^,\s*", "", cleaned.strip())
+    return cleaned.strip()
+
+
+def _names_for_reply_target(context: ReplyToUserContext) -> tuple[str, ...]:
+    names: list[str] = []
+    full = context.target_name.strip()
+    if full:
+        names.append(full)
+        first = full.split(maxsplit=1)[0]
+        if first:
+            names.append(first)
+    label = context.target_mention.split("|", 1)[-1].rstrip("]").strip()
+    if label:
+        names.append(label)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        key = name.casefold()
+        if len(name) >= 2 and key not in seen:
+            seen.add(key)
+            unique.append(name)
+    return tuple(unique)
+
+
+def strip_leading_target_name(text: str, context: ReplyToUserContext) -> str:
+    """Убирает имя адресата в начале: «Meow, ты чё» → «ты чё»."""
+    result = text.strip()
+    for name in sorted(_names_for_reply_target(context), key=len, reverse=True):
+        for pattern in (
+            re.compile(rf"^{re.escape(name)}\s*[,!:—\-–]\s*", re.IGNORECASE),
+            re.compile(rf"^{re.escape(name)}\s+", re.IGNORECASE),
+        ):
+            updated = pattern.sub("", result, count=1)
+            if updated != result:
+                result = updated.strip()
+                break
+    return result
+
+
+def clean_reply_to_user_text(text: str, context: ReplyToUserContext) -> str:
+    """Reply-to-user: без [id|...] и без имени в начале."""
+    cleaned = strip_vk_user_mentions(text)
+    cleaned = strip_leading_target_name(cleaned, context)
+    cleaned = re.sub(r" +", " ", cleaned)
+    cleaned = re.sub(r"^,\s*", "", cleaned.strip())
+    return cleaned.strip()
