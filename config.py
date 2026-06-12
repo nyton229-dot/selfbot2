@@ -1,6 +1,9 @@
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def data_dir() -> Path:
@@ -28,6 +31,7 @@ class Settings:
     ai_tts_model: str
     ai_tts_voice: str
     ai_tts_base_url: str
+    ai_tts_provider: str
     ai_max_tokens: int
     transcribe_video: str
     longpoll_preload: bool
@@ -62,11 +66,18 @@ def _resolve_ai_settings() -> tuple[str, str, str, str]:
     if not provider:
         provider = "openrouter" if openrouter_key else "bothub"
 
+    if provider == "openrouter" and not openrouter_key and bothub_key:
+        logger.warning(
+            "AI_PROVIDER=openrouter, но OPENROUTER_API_KEY пуст — переключаюсь на bothub"
+        )
+        provider = "bothub"
+
     if provider == "openrouter":
         if not openrouter_key:
             raise RuntimeError(
                 "AI_PROVIDER=openrouter, но OPENROUTER_API_KEY не задан. "
-                "Ключ: https://openrouter.ai/keys"
+                "Ключ: https://openrouter.ai/keys "
+                "Или укажи AI_PROVIDER=bothub и BOTHUB_API_KEY в переменных Bothost."
             )
         base_url = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1").strip()
         model = os.getenv("AI_MODEL", "anthropic/claude-sonnet-4.6").strip()
@@ -74,8 +85,9 @@ def _resolve_ai_settings() -> tuple[str, str, str, str]:
 
     if not bothub_key:
         raise RuntimeError(
-            "Не задан OPENROUTER_API_KEY и BOTHUB_API_KEY. "
-            "Добавьте один из ключей в .env"
+            "Не задан BOTHUB_API_KEY (и OPENROUTER_API_KEY тоже пуст). "
+            "На Bothost: настройки бота → переменные окружения → BOTHUB_API_KEY и AI_PROVIDER=bothub. "
+            "Локально: скопируй .env.example в .env и заполни ключи."
         )
     base_url = os.getenv(
         "AI_BASE_URL", os.getenv("BOTHUB_BASE_URL", "https://bothub.chat/api/v2/openai/v1")
@@ -93,11 +105,37 @@ def _load_vk_tokens() -> tuple[str, ...]:
     return tuple(tokens)
 
 
+def _resolve_tts_provider() -> str:
+    raw = os.getenv("AI_TTS_PROVIDER", "").strip().lower()
+    if raw in ("bothub", "edge", "auto"):
+        return raw
+    if os.getenv("BOT_ID"):
+        return "edge"
+    return "auto"
+
+
+def log_startup_env(provider: str, tts_provider: str) -> None:
+    """Диагностика для Bothost: какие переменные реально видит процесс."""
+    bothost = bool(os.getenv("BOT_ID"))
+    logger.info(
+        "Старт: bothost=%s data_dir=%s provider=%s tts=%s vk_token=%s bothub_key=%s openrouter_key=%s",
+        bothost,
+        data_dir(),
+        provider,
+        tts_provider,
+        "да" if os.getenv("VK_USER_TOKEN", "").strip() else "нет",
+        "да" if os.getenv("BOTHUB_API_KEY", "").strip() else "нет",
+        "да" if os.getenv("OPENROUTER_API_KEY", "").strip() else "нет",
+    )
+
+
 def load_settings() -> Settings:
     _load_dotenv()
 
     vk_user_tokens = _load_vk_tokens()
     ai_provider, ai_api_key, ai_base_url, ai_model = _resolve_ai_settings()
+    ai_tts_provider = _resolve_tts_provider()
+    log_startup_env(ai_provider, ai_tts_provider)
     ai_vision_model = os.getenv("AI_VISION_MODEL", "claude-sonnet-4.6").strip()
     ai_whisper_model = os.getenv("AI_WHISPER_MODEL", "whisper-1").strip()
     ai_tts_model = os.getenv("AI_TTS_MODEL", "tts-1-1106").strip()
@@ -165,6 +203,7 @@ def load_settings() -> Settings:
         ai_tts_model=ai_tts_model,
         ai_tts_voice=ai_tts_voice,
         ai_tts_base_url=ai_tts_base_url,
+        ai_tts_provider=ai_tts_provider,
         ai_max_tokens=ai_max_tokens,
         transcribe_video=transcribe_video,
         longpoll_preload=longpoll_preload,

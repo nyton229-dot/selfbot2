@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -139,13 +141,8 @@ def synthesize_speech(
     raise RuntimeError("; ".join(errors[-3:]) or "TTS BotHub недоступен")
 
 
-def _edge_tts_mp3(text: str, voice: str) -> bytes:
-    try:
-        import edge_tts
-    except ImportError as exc:
-        raise RuntimeError(
-            "BotHub TTS недоступен. Установи edge-tts: pip install edge-tts"
-        ) from exc
+def _edge_tts_async(text: str, voice: str) -> bytes:
+    import edge_tts
 
     edge_voice = resolve_edge_voice(voice)
 
@@ -160,16 +157,102 @@ def _edge_tts_mp3(text: str, voice: str) -> bytes:
             raise RuntimeError("edge-tts вернул пустой аудиофайл")
         return data
 
-    return asyncio.run(_run())
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def _edge_tts_cli_mp3(text: str, voice: str) -> bytes:
+    edge_voice = resolve_edge_voice(voice)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        text_path = os.path.join(tmp_dir, "speech.txt")
+        mp3_path = os.path.join(tmp_dir, "speech.mp3")
+        Path(text_path).write_text(text, encoding="utf-8")
+        command = [
+            sys.executable,
+            "-m",
+            "edge_tts",
+            "-f",
+            text_path,
+            "-v",
+            edge_voice,
+            "--write-media",
+            mp3_path,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=90)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"edge-tts CLI: {(result.stderr or result.stdout or '')[:300]}"
+            )
+        if not os.path.isfile(mp3_path):
+            raise RuntimeError("edge-tts CLI не создал mp3")
+        return Path(mp3_path).read_bytes()
+
+
+def synthesize_edge_speech(text: str, voice: str) -> bytes:
+    errors: list[str] = []
+    for name, runner in (
+        ("edge-tts", _edge_tts_async),
+        ("edge-tts-cli", _edge_tts_cli_mp3),
+    ):
+        try:
+            data = runner(text, voice)
+            logger.info("TTS %s (%d байт)", name, len(data))
+            return data
+        except Exception as exc:
+            message = f"{name}: {exc}"
+            errors.append(message)
+            logger.warning("TTS %s не сработал: %s", name, exc)
+    raise RuntimeError("; ".join(errors) or "edge-tts недоступен")
+
+
+def _edge_tts_mp3(text: str, voice: str) -> bytes:
+    try:
+        import edge_tts  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "edge-tts не установлен. На Bothost: pip install edge-tts в requirements.txt"
+        ) from exc
+    return synthesize_edge_speech(text, voice)
+
+
+def log_tts_startup(tts_provider: str) -> None:
+    ffmpeg = find_ffmpeg()
+    try:
+        import edge_tts  # noqa: F401
+
+        edge_ok = "да"
+    except ImportError:
+        edge_ok = "нет"
+    logger.info(
+        "TTS: режим=%s ffmpeg=%s edge-tts=%s",
+        tts_provider,
+        ffmpeg or "нет",
+        edge_ok,
+    )
 
 
 def mp3_bytes_to_voice_ogg(mp3_data: bytes) -> str:
     ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError(
-            "Нужен ffmpeg для озвучки. Установи: winget install Gyan.FFmpeg"
-        )
+    if ffmpeg:
+        try:
+            return _mp3_to_ogg_ffmpeg(mp3_data, ffmpeg)
+        except RuntimeError as exc:
+            logger.warning("ffmpeg конвертация не удалась (%s), пробую PyAV", exc)
 
+    try:
+        return _mp3_to_ogg_pyav(mp3_data)
+    except Exception as exc:
+        logger.warning("PyAV конвертация не удалась (%s)", exc)
+
+    raise RuntimeError(
+        "Нет ffmpeg для озвучки. Пересобери бота — в requirements.txt должен быть imageio-ffmpeg."
+    )
+
+
+def _mp3_to_ogg_ffmpeg(mp3_data: bytes, ffmpeg: str) -> str:
     with tempfile.TemporaryDirectory() as tmp_dir:
         mp3_path = os.path.join(tmp_dir, "speech.mp3")
         ogg_path = os.path.join(tmp_dir, "voice.ogg")
@@ -200,14 +283,46 @@ def mp3_bytes_to_voice_ogg(mp3_data: bytes) -> str:
             logger.error("ffmpeg TTS stderr: %s", (result.stderr or "")[-500:])
             raise RuntimeError("ffmpeg не сконвертировал озвучку в голосовое")
 
-        if not os.path.isfile(ogg_path):
-            raise RuntimeError("ffmpeg не создал ogg-файл")
-        if os.path.getsize(ogg_path) > MAX_VOICE_BYTES:
-            raise RuntimeError("Голосовое слишком длинное — сократи запрос")
+        return _finalize_ogg_path(ogg_path)
 
-        out_path = os.path.join(tempfile.gettempdir(), f"lpbot_tts_{os.getpid()}.ogg")
-        Path(out_path).write_bytes(Path(ogg_path).read_bytes())
-        return out_path
+
+def _mp3_to_ogg_pyav(mp3_data: bytes) -> str:
+    import av
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ogg_path = os.path.join(tmp_dir, "voice.ogg")
+        input_container = av.open(io.BytesIO(mp3_data))
+        output_container = av.open(ogg_path, mode="w", format="ogg")
+        output_stream = output_container.add_stream("libopus", rate=48000)
+        output_stream.layout = "mono"
+        output_stream.bit_rate = 32000
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
+
+        seconds = 0.0
+        for frame in input_container.decode(audio=0):
+            seconds += float(frame.samples) / float(frame.sample_rate or 1)
+            if seconds > MAX_VOICE_SEC:
+                break
+            for resampled in resampler.resample(frame):
+                resampled.pts = None
+                for packet in output_stream.encode(resampled):
+                    output_container.mux(packet)
+        for packet in output_stream.encode(None):
+            output_container.mux(packet)
+
+        output_container.close()
+        input_container.close()
+        return _finalize_ogg_path(ogg_path)
+
+
+def _finalize_ogg_path(ogg_path: str) -> str:
+    if not os.path.isfile(ogg_path):
+        raise RuntimeError("не создан ogg-файл")
+    if os.path.getsize(ogg_path) > MAX_VOICE_BYTES:
+        raise RuntimeError("Голосовое слишком длинное — сократи запрос")
+    out_path = os.path.join(tempfile.gettempdir(), f"lpbot_tts_{os.getpid()}.ogg")
+    Path(out_path).write_bytes(Path(ogg_path).read_bytes())
+    return out_path
 
 
 def text_to_voice_file(
@@ -218,12 +333,18 @@ def text_to_voice_file(
     model: str,
     voice: str,
     tts_base_url: str = "",
+    tts_provider: str = "auto",
     allow_edge_fallback: bool = True,
 ) -> tuple[str, str]:
     speech_text = text_for_speech(text)
     openai_voice = resolve_openai_voice(voice)
-    provider = "bothub"
-    try:
+    mode = (tts_provider or "auto").strip().lower()
+    mp3_data: bytes
+    provider = "edge-tts"
+
+    if mode == "edge":
+        mp3_data = synthesize_edge_speech(speech_text, voice)
+    elif mode == "bothub":
         mp3_data, provider = synthesize_speech(
             speech_text,
             api_key=api_key,
@@ -232,12 +353,21 @@ def text_to_voice_file(
             voice=openai_voice,
             tts_base_url=tts_base_url,
         )
-    except RuntimeError as exc:
-        if not allow_edge_fallback:
-            raise
-        logger.warning("BotHub TTS не сработал (%s), пробую edge-tts", exc)
-        mp3_data = _edge_tts_mp3(speech_text, voice)
-        provider = "edge-tts"
-        logger.info("TTS edge-tts (%d байт)", len(mp3_data))
+    else:
+        try:
+            mp3_data, provider = synthesize_speech(
+                speech_text,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                voice=openai_voice,
+                tts_base_url=tts_base_url,
+            )
+        except RuntimeError as exc:
+            if not allow_edge_fallback:
+                raise
+            logger.warning("BotHub TTS не сработал (%s), пробую edge-tts", exc)
+            mp3_data = synthesize_edge_speech(speech_text, voice)
+            provider = "edge-tts"
 
     return mp3_bytes_to_voice_ogg(mp3_data), provider

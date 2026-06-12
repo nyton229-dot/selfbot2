@@ -69,7 +69,7 @@ from vk_reply import (
     reply_message_conversation_id,
     reply_message_text,
 )
-from tts_client import text_to_voice_file
+from tts_client import log_tts_startup, text_to_voice_file
 from tts_voices import (
     apply_voice_command,
     init_voice_store,
@@ -454,6 +454,7 @@ class VkDmBot:
             self._my_user_id,
         )
         self._user_names: dict[int, str] = {}
+        log_tts_startup(settings.ai_tts_provider)
         logger.info(
             "Акк %s: AI provider=%s text_model=%s vision_model=%s tts_voice=%s",
             account_id,
@@ -669,6 +670,7 @@ class VkDmBot:
                 model=self._settings.ai_tts_model,
                 voice=self._voices.voice_id,
                 tts_base_url=self._settings.ai_tts_base_url,
+                tts_provider=self._settings.ai_tts_provider,
             )
             logger.info("Озвучка через %s", tts_provider)
             send_voice_message(
@@ -1252,6 +1254,24 @@ class VkDmBot:
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
+        def _log_asyncio_failure(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+            exc = context.get("exception")
+            if exc is not None:
+                logger.exception(
+                    "Необработанная ошибка asyncio [акк %s]: %s",
+                    self._account_id,
+                    context.get("message"),
+                    exc_info=exc,
+                )
+            else:
+                logger.error(
+                    "Необработанная ошибка asyncio [акк %s]: %s",
+                    self._account_id,
+                    context,
+                )
+
+        loop.set_exception_handler(_log_asyncio_failure)
+
         listener = threading.Thread(
             target=vk_listener_thread,
             args=(
@@ -1322,6 +1342,9 @@ def main() -> None:
         sys.exit(1)
     except RuntimeError as exc:
         logger.error("%s", exc)
+        sys.exit(1)
+    except Exception:
+        logger.exception("Бот остановлен из-за неожиданной ошибки")
         sys.exit(1)
 
 

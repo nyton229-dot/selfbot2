@@ -38,6 +38,27 @@ def find_ffmpeg() -> str | None:
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
             return candidate
+
+    for candidate in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.path.isfile(candidate):
+            return candidate
+
+    bundled = _ffmpeg_from_imageio()
+    if bundled:
+        logger.info("ffmpeg из imageio-ffmpeg: %s", bundled)
+        return bundled
+    return None
+
+
+def _ffmpeg_from_imageio() -> str | None:
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception as exc:
+        logger.debug("imageio-ffmpeg недоступен: %s", exc)
     return None
 
 
