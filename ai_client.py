@@ -54,8 +54,8 @@ _BOT_ADMISSION_PATTERNS = (
 _BOT_ADMISSION_RE = re.compile("|".join(_BOT_ADMISSION_PATTERNS), re.IGNORECASE)
 
 _BOT_ADMISSION_RETRY_SUFFIX = (
-    "Ты снова выдал, что ты бот или ИИ. Перепиши как Артём — живой злой пацан из чата. "
-    "Не признавай, что программа. Грубо, с характером, без мата."
+    "Ты снова выдал, что ты бот или ИИ. Перепиши как девственник с имиджборда — "
+    "токсично, с лёгким вк-матом, грамотно. Не признавай, что программа."
 )
 
 _REFUSAL_RETRY_SUFFIX = (
@@ -175,7 +175,7 @@ def _verbalize_domain(match: re.Match[str]) -> str:
 _LINK_RETRY_SUFFIX = (
     "В ответе были ссылки или домены — так нельзя. Перепиши без URL и без формата "
     "site.com. Если нужно назвать сайт — только словами: «гугл точка ком». "
-    "Только текст, зло и пошло, в своём стиле, но без жёсткого мата."
+    "Только текст, токсично, в стиле имиджборда."
 )
 
 
@@ -358,7 +358,35 @@ def sanitize_ai_reply(text: str) -> str:
         logger.info("Ссылки вырезаны из ответа ИИ")
     result = re.sub(r" +", " ", stripped)
     result = re.sub(r"\s+([,.!?])", r"\1", result)
-    return result.strip()
+    return trim_incomplete_reply_tail(result.strip())
+
+
+_COMPLETE_REPLY_END_RE = re.compile(r'[.!?…»"\'\)]$')
+
+
+def trim_incomplete_reply_tail(text: str) -> str:
+    """Убирает оборванное последнее слово/предложение после лимита токенов."""
+    normalized = text.strip()
+    if not normalized:
+        return normalized
+    if _COMPLETE_REPLY_END_RE.search(normalized):
+        return normalized
+
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    if len(sentences) > 1:
+        head = " ".join(sentences[:-1]).strip()
+        if head:
+            logger.warning("Ответ оборван — оставлены только целые предложения")
+            return head
+
+    if " " in normalized:
+        head, tail = normalized.rsplit(" ", 1)
+        if len(tail) < 8:
+            trimmed = head.strip()
+            if trimmed:
+                logger.warning("Ответ оборван на «%s» — обрезан хвост", tail)
+                return trimmed
+    return normalized
 
 
 _TYPO_MARKERS = (
@@ -482,11 +510,11 @@ _TYPO_SUBS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bответь\b", re.IGNORECASE), "атветь"),
 )
 
-_TYPO_STYLE_REMINDER = (
-    "ОБЯЗАТЕЛЬНО пиши криво, с косяками в каждом предложении — не только што/патамушта. "
-    "Косячь в разных словах: ето, нада, выглядет, дешовая, жывой, челавека, смортит, филтр, "
-    "пазорище, осталос, фсех, смисл, есле, ужэ, настаящие, красяца. "
-    "Пиши как тупишь в ВК с телефона — минимум 5–8 ошибок на ответ, но читается."
+_STYLE_REMINDER = (
+    "2–3 законченных предложения, токсичный коммент как на имиджборде. "
+    "Не обрывай на полуслове — каждое предложение должно быть дописано до конца. "
+    "Лёгкий вк-мат (бля, хер, дебил, лох) — без жёсткого, чтобы не забанили. "
+    "Пиши грамотно, без намеренных ошибок."
 )
 
 
@@ -547,7 +575,7 @@ def ensure_chat_typos(text: str) -> str:
 
 def format_bot_message(text: str) -> str:
     """Финальная обработка любого исходящего сообщения бота."""
-    return ensure_chat_typos(sanitize_ai_reply(text))
+    return sanitize_ai_reply(text)
 
 
 def strip_links(text: str) -> tuple[str, bool]:
@@ -707,7 +735,11 @@ class AiClient:
                     f"Ниже {photo_count} картинки. Сравни их и токсично оцени каждую."
                 )
             else:
-                chunks.append("Ниже картинка. Опиши что видишь и токсично оцени.")
+                chunks.append(
+                    "Ниже картинка. Токсично оцени в 2–3 законченных предложениях, "
+                    "не обрывай на полуслове, лёгкий вк-мат без жёсткого, "
+                    "без «на картинке изображено», пиши грамотно."
+                )
             if reply_to_user is not None:
                 chunks.append(
                     f"Ответь автору сообщения «{reply_to_user.replied_text}»."
@@ -718,7 +750,7 @@ class AiClient:
                 chunks.append(f"Запрос: {user_text}")
             return "\n\n".join(chunks)
 
-        chunks: list[str] = [_TYPO_STYLE_REMINDER]
+        chunks: list[str] = [_STYLE_REMINDER]
         if owner_trigger and owner_self_media:
             if user_requests_justify(user_text):
                 chunks.append(_OWNER_SELF_MEDIA_JUSTIFY_HINT)
@@ -953,17 +985,12 @@ class AiClient:
         video_transcript: str | None = None,
         reply_to_user: ReplyToUserContext | None = None,
     ) -> tuple[str, bool]:
-        photo_vision_mode = bool(photo_data_urls)
         url = f"{self._settings.ai_base_url}/chat/completions"
         image_data_urls = list(photo_data_urls or []) + list(video_data_urls or [])
         model = self.vision_model if image_data_urls else self.text_model
         temperature = 0.9
         timeout = 75 if image_data_urls else 40
-        max_tokens = (
-            min(self._settings.ai_max_tokens, 350)
-            if photo_vision_mode
-            else self._settings.ai_max_tokens
-        )
+        max_tokens = self._settings.ai_max_tokens
         payload: dict[str, Any] = {
             "model": model,
             "temperature": temperature,
@@ -997,9 +1024,14 @@ class AiClient:
         data = response.json()
 
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Неожиданный ответ AI API: {data}") from exc
+
+        if finish_reason == "length":
+            logger.warning("AI обрезал ответ по max_tokens=%d", max_tokens)
 
         if not content:
             raise RuntimeError("AI API вернул пустой ответ")
