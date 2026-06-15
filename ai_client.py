@@ -698,7 +698,26 @@ class AiClient:
         owner_names: tuple[str, ...] = (),
         video_transcript: str | None = None,
         reply_to_user: ReplyToUserContext | None = None,
+        photo_vision_mode: bool = False,
     ) -> str:
+        if photo_vision_mode:
+            chunks: list[str] = []
+            if compare_photos and photo_count >= 2:
+                chunks.append(
+                    f"Ниже {photo_count} картинки. Сравни их и токсично оцени каждую."
+                )
+            else:
+                chunks.append("Ниже картинка. Опиши что видишь и токсично оцени.")
+            if reply_to_user is not None:
+                chunks.append(
+                    f"Ответь автору сообщения «{reply_to_user.replied_text}»."
+                )
+                if reply_to_user.extra_instruction:
+                    chunks.append(f"Инструкция: {reply_to_user.extra_instruction}")
+            if user_text.strip():
+                chunks.append(f"Запрос: {user_text}")
+            return "\n\n".join(chunks)
+
         chunks: list[str] = [_TYPO_STYLE_REMINDER]
         if owner_trigger and owner_self_media:
             if user_requests_justify(user_text):
@@ -850,6 +869,7 @@ class AiClient:
         reply_to_user: ReplyToUserContext | None = None,
     ) -> str | list[dict[str, Any]]:
         photo_count = len(photo_data_urls or [])
+        photo_vision_mode = bool(photo_data_urls)
         text = self._compose_user_text(
             user_text,
             chat_context,
@@ -864,6 +884,7 @@ class AiClient:
             owner_names,
             video_transcript,
             reply_to_user,
+            photo_vision_mode=photo_vision_mode,
         )
         image_data_urls = list(photo_data_urls or []) + list(video_data_urls or [])
         if not image_data_urls:
@@ -893,7 +914,13 @@ class AiClient:
         owner_self_media: bool,
         reply_to_user: ReplyToUserContext | None = None,
         user_text: str = "",
+        *,
+        photo_vision_mode: bool = False,
     ) -> str:
+        if photo_vision_mode:
+            vision = self._settings.ai_vision_prompt.strip()
+            if vision:
+                return vision
         base = self._system_content(system_prompt)
         if owner_self_media:
             overlay = (
@@ -926,15 +953,21 @@ class AiClient:
         video_transcript: str | None = None,
         reply_to_user: ReplyToUserContext | None = None,
     ) -> tuple[str, bool]:
+        photo_vision_mode = bool(photo_data_urls)
         url = f"{self._settings.ai_base_url}/chat/completions"
         image_data_urls = list(photo_data_urls or []) + list(video_data_urls or [])
         model = self.vision_model if image_data_urls else self.text_model
         temperature = 0.9
         timeout = 75 if image_data_urls else 40
+        max_tokens = (
+            min(self._settings.ai_max_tokens, 350)
+            if photo_vision_mode
+            else self._settings.ai_max_tokens
+        )
         payload: dict[str, Any] = {
             "model": model,
             "temperature": temperature,
-            "max_tokens": self._settings.ai_max_tokens,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {
@@ -1058,7 +1091,8 @@ class AiClient:
         reply = sanitize_ai_reply(reply)
         if reply_to_user is not None:
             reply = clean_reply_to_user_text(reply, reply_to_user)
-        if owner_trigger and (has_photos or has_video):
+        photo_vision_mode = bool(photo_data_urls)
+        if owner_trigger and (has_photos or has_video) and not photo_vision_mode:
             reply = self._enforce_photo_roast(
                 reply,
                 system_prompt,
@@ -1098,12 +1132,14 @@ class AiClient:
         video_transcript: str | None = None,
         reply_to_user: ReplyToUserContext | None = None,
     ) -> str:
+        photo_vision_mode = bool(photo_data_urls)
         system_prompt = self._resolve_system_prompt(
             system_prompt,
             owner_trigger,
             owner_self_media,
             reply_to_user,
             user_text,
+            photo_vision_mode=photo_vision_mode,
         )
         image_data_urls = list(photo_data_urls or []) + list(video_data_urls or [])
         reply, had_links = self._call_chat(
@@ -1146,7 +1182,7 @@ class AiClient:
             if retry_reply:
                 reply = retry_reply
                 had_links = retry_links
-        if owner_self_media:
+        if not photo_vision_mode and owner_self_media:
             reply = clean_owner_self_media_reply(reply)
             if reply_mentions_chat_roast(reply):
                 logger.warning("Ответ про участников чата (%d симв.), перегенерирую", len(reply))
@@ -1191,7 +1227,7 @@ class AiClient:
                 video_transcript,
                 reply_to_user,
             )
-        if owner_trigger and owner_labels and reply_mentions_owner(reply, owner_labels, owner_names):
+        if not photo_vision_mode and owner_trigger and owner_labels and reply_mentions_owner(reply, owner_labels, owner_names):
             logger.warning("Ответ задел владельца (%d симв.), перегенерирую", len(reply))
             retry_prompt = f"{system_prompt}\n\n{_OWNER_RETRY_SUFFIX}"
             retry, _ = self._call_chat(

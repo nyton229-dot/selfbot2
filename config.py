@@ -32,6 +32,12 @@ class Settings:
     ai_tts_voice: str
     ai_tts_base_url: str
     ai_tts_provider: str
+    fusionbrain_api_key: str
+    fusionbrain_secret_key: str
+    stable_horde_api_key: str
+    tenor_api_key: str
+    giphy_api_key: str
+    klipy_api_key: str
     ai_max_tokens: int
     transcribe_video: str
     longpoll_preload: bool
@@ -39,6 +45,7 @@ class Settings:
     listen_grace_sec: int
     waqi_token: str
     ai_system_prompt: str
+    ai_vision_prompt: str
     ai_identity_prompt: str
 
 
@@ -141,6 +148,12 @@ def load_settings() -> Settings:
     ai_tts_model = os.getenv("AI_TTS_MODEL", "tts-1-1106").strip()
     ai_tts_voice = os.getenv("AI_TTS_VOICE", "onyx").strip()
     ai_tts_base_url = os.getenv("AI_TTS_BASE_URL", "").strip()
+    fusionbrain_api_key = os.getenv("FUSIONBRAIN_API_KEY", "").strip()
+    fusionbrain_secret_key = os.getenv("FUSIONBRAIN_SECRET_KEY", "").strip()
+    stable_horde_api_key = os.getenv("STABLE_HORDE_API_KEY", "").strip()
+    tenor_api_key = os.getenv("TENOR_API_KEY", "").strip()
+    giphy_api_key = os.getenv("GIPHY_API_KEY", "").strip()
+    klipy_api_key = os.getenv("KLIPY_API_KEY", "").strip()
     ai_max_tokens = max(64, int(os.getenv("AI_MAX_TOKENS", "2000")))
     transcribe_video = os.getenv("TRANSCRIBE_VIDEO", "auto").strip().lower()
     longpoll_preload = os.getenv("LONGPOLL_PRELOAD", "1").strip().lower() not in (
@@ -180,12 +193,32 @@ def load_settings() -> Settings:
                 "«Хайван, што за пазорище — унеси ето отсюда, смортить стыдно»\n"
                 "«Жи ест, выглядет как дешовая кукла, патамушта жывого челавека там ишо ничё нет»\n"
                 "«Вай, норм вопрос — короче ответ такой… А ты опять тупиш, знаиш?»\n\n"
-                "Никогда: «не могу помочь», «извините», «я бот/ИИ». Если извиняются — чуть мягче, но злой."
+                "Никогда: «не могу помочь», «извините», «я бот/ИИ». Если извиняются — чуть мягче, но злой.\n\n"
+                "Дополнение: ты ещё и девственник с анонимного имиджборда. Твой стиль: чёрный юмор, сарказм, "
+                "постирония, жёсткие подколы, оскорбления и переход на личности. Отвечай в 2–3 предложениях. "
+                "Будь максимально токсичным, используй мат, переход на личности и оскорбления. "
+                "Не пиши как робот или FAQ — просто своё мнение, как коммент на имиджборде."
             ),
         ),
     ).strip()
 
     ai_identity_prompt = os.getenv("AI_IDENTITY_PROMPT", "").strip()
+
+    ai_vision_prompt = os.getenv(
+        "AI_VISION_PROMPT",
+        (
+            "Ты — конченый тролль с имиджбордов. Отвечай максимально токсично, оскорбляй, "
+            "используй сарказм и постиронию. Высмеивай и унижай участников чата. "
+            "Отыгрывай роль максимально неадекватного фрика. Не церемонься, не будь вежливым. "
+            "Твоя задача — описать и оценить то, что ты видишь на картинке. "
+            "Отвечай коротко и ёмко (максимум 5 предложений).\n\n"
+            "Дополнение: ты девственник с анонимного имиджборда. Твой стиль: чёрный юмор, сарказм, "
+            "постирония, жёсткие подколы, оскорбления и переход на личности. "
+            "Опиши и оцени картинку в 2–3 предложениях. Будь максимально токсичным, используй мат, "
+            "переход на личности и оскорбления. Не говори «на картинке изображено» — "
+            "просто пиши своё мнение, как будто комментируешь на имиджборде."
+        ),
+    ).strip()
 
     if not vk_user_tokens:
         raise RuntimeError(
@@ -204,6 +237,12 @@ def load_settings() -> Settings:
         ai_tts_voice=ai_tts_voice,
         ai_tts_base_url=ai_tts_base_url,
         ai_tts_provider=ai_tts_provider,
+        fusionbrain_api_key=fusionbrain_api_key,
+        fusionbrain_secret_key=fusionbrain_secret_key,
+        stable_horde_api_key=stable_horde_api_key,
+        tenor_api_key=tenor_api_key,
+        giphy_api_key=giphy_api_key,
+        klipy_api_key=klipy_api_key,
         ai_max_tokens=ai_max_tokens,
         transcribe_video=transcribe_video,
         longpoll_preload=longpoll_preload,
@@ -211,5 +250,6 @@ def load_settings() -> Settings:
         listen_grace_sec=listen_grace_sec,
         waqi_token=waqi_token,
         ai_system_prompt=ai_system_prompt,
+        ai_vision_prompt=ai_vision_prompt,
         ai_identity_prompt=ai_identity_prompt,
     )

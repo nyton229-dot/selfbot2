@@ -46,7 +46,12 @@ from ai_client import (
     wants_photo_compare,
 )
 from config import Settings, data_dir, load_settings
+from fusionbrain_client import generate_image as generate_kandinsky_image
+from gif_client import search_gif
+from horde_client import generate_image as generate_horde_image
 from instance_lock import acquire_instance_lock, release_instance_lock
+from meme_client import build_meme
+from quote_client import build_quote_image
 from video_transcribe import should_transcribe_video, transcribe_videos_in_message
 from vk_avatar import (
     fetch_user_avatar,
@@ -56,7 +61,6 @@ from vk_avatar import (
     resolve_user_id,
     send_avatar_reply,
 )
-from vk_vgs import is_vgs_command, process_vgs_command
 from vk_delete import FAKE_DELETE_MESSAGES, is_delete_command
 from vk_info import format_ai_info, is_info_command
 from vk_weather import fetch_weather_report, is_weather_command, parse_city_name
@@ -69,23 +73,21 @@ from vk_reply import (
     reply_message_conversation_id,
     reply_message_text,
 )
-from tts_client import log_tts_startup, text_to_voice_file
-from tts_voices import (
-    apply_voice_command,
-    init_voice_store,
-    is_artem_voice_command,
-    is_voice_command,
-    parse_voice_command,
-    voice_label,
-)
+from vk_media_send import send_gif_url, send_image_bytes
 from vk_text_cmds import (
+    build_image_prompt,
     build_kratko_prompt,
+    build_meme_caption,
+    build_narisuy_caption,
     build_spor_extra_instruction,
+    parse_gif_command,
     parse_kratko_command,
+    parse_meme_command,
+    parse_narisuy_command,
+    parse_quote_command,
     parse_spor_command,
-    split_prompt_flags,
+    strip_tts_keyword,
 )
-from vk_voice import send_voice_message
 from vk_media import (
     count_photos,
     load_message_images,
@@ -136,10 +138,9 @@ def resolve_prompt(text: str, has_media: bool, photo_count: int = 0) -> str | No
     if rest:
         return rest
     if photo_count >= 2:
-        return (
-            "Сравни оба фото: что общего, чем отличаются — "
-            "и унизь того, кто это скинул — зло и пошло."
-        )
+        return "сравни оба фото"
+    if photo_count >= 1:
+        return "оцени картинку"
     if has_media:
         return (
             "Грубо и зло скажи что на фото или видео — без сухого «на фотке мужик держит». "
@@ -223,17 +224,6 @@ def should_queue_ava_event(event: Any) -> bool:
     return bool(event.to_me and not event.from_me)
 
 
-def should_queue_vgs_event(event: Any) -> bool:
-    """Команда /вгс — видео в голосовое, без ИИ."""
-    if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
-        return False
-    text = (event.text or "").strip()
-    if not is_vgs_command(text):
-        return False
-    if event.from_me:
-        return True
-    return bool(event.to_me and not event.from_me)
-
 
 def should_queue_info_event(event: Any) -> bool:
     """Команда /инфо — сведения об используемом ИИ."""
@@ -264,14 +254,6 @@ def should_queue_ii_event(event: Any) -> bool:
         return False
     return is_ii_command((event.text or "").strip())
 
-
-def should_queue_voice_event(event: Any) -> bool:
-    """Команда /голос — смена голоса озвучки, только от владельца."""
-    if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
-        return False
-    if not event.from_me:
-        return False
-    return is_voice_command((event.text or "").strip())
 
 
 def should_queue_dov_list_event(event: Any) -> bool:
@@ -351,14 +333,10 @@ def _handle_longpoll_event(
         kind = "weather"
     elif should_queue_ava_event(event):
         kind = "ava"
-    elif should_queue_vgs_event(event):
-        kind = "vgs"
     elif should_queue_info_event(event):
         kind = "info"
     elif should_queue_ii_event(event):
         kind = "ii"
-    elif should_queue_voice_event(event):
-        kind = "voice"
     elif should_queue_delete_event(event):
         kind = "delete"
     elif should_queue_dov_list_event(event):
@@ -437,10 +415,6 @@ class VkDmBot:
             settings.ai_model,
             settings.ai_vision_model,
         )
-        self._voices = init_voice_store(
-            _account_store_path("tts_voice", account_id, multi_account),
-            settings.ai_tts_voice,
-        )
         self._ai = AiClient(settings, self._models)
 
         self._vk_session = vk_api.VkApi(token=vk_token)
@@ -454,14 +428,12 @@ class VkDmBot:
             self._my_user_id,
         )
         self._user_names: dict[int, str] = {}
-        log_tts_startup(settings.ai_tts_provider)
         logger.info(
-            "Акк %s: AI provider=%s text_model=%s vision_model=%s tts_voice=%s",
+            "Акк %s: AI provider=%s text_model=%s vision_model=%s",
             account_id,
             settings.ai_provider,
             self._models.text_model,
             self._models.vision_model,
-            voice_label(self._voices.voice_id),
         )
 
     def _init_owner_account(self) -> int:
@@ -653,40 +625,219 @@ class VkDmBot:
                 error,
             )
 
-    def _send_voice_reply(
+    def _fusionbrain_configured(self) -> bool:
+        return bool(
+            self._settings.fusionbrain_api_key.strip()
+            and self._settings.fusionbrain_secret_key.strip()
+        )
+
+    def _resolve_image_provider(self, requested: str) -> str:
+        if requested in ("kandinsky", "horde"):
+            return requested
+        if self._fusionbrain_configured():
+            return "kandinsky"
+        return "horde"
+
+    def _generate_narisuy_image(self, prompt: str, provider: str) -> tuple[bytes, str]:
+        image_prompt = build_image_prompt(prompt)
+        if provider == "kandinsky":
+            if not self._fusionbrain_configured():
+                raise RuntimeError(
+                    "Kandinsky не настроен. Добавь FUSIONBRAIN_API_KEY и FUSIONBRAIN_SECRET_KEY "
+                    "с https://fusionbrain.ai/keys/ или пиши «артем нарисуй horde …»"
+                )
+            image = generate_kandinsky_image(
+                image_prompt,
+                api_key=self._settings.fusionbrain_api_key,
+                secret_key=self._settings.fusionbrain_secret_key,
+            )
+            return image, "Kandinsky"
+        image = generate_horde_image(
+            image_prompt,
+            api_key=self._settings.stable_horde_api_key,
+        )
+        return image, "Stable Horde"
+
+    def _send_narisuy_reply(self, peer_id: int, event: Any, command: Any) -> None:
+        provider = self._resolve_image_provider(command.provider)
+        image_bytes, provider_label = self._generate_narisuy_image(command.prompt, provider)
+        caption = build_narisuy_caption(command.prompt, provider_label)
+        send_image_bytes(
+            self._vk_session,
+            self._vk,
+            peer_id,
+            event,
+            image_bytes,
+            caption=caption,
+            suffix=".jpg",
+        )
+
+    def _resolve_gif_query(self, command: Any, message_data: dict[str, Any] | None) -> str:
+        if command.query:
+            return command.query
+        reply_msg = get_reply_message(message_data)
+        if reply_msg is not None:
+            source = reply_message_text(reply_msg).strip()
+            if source and not source.startswith("["):
+                return source[:120]
+        return "facepalm reaction meme"
+
+    def _send_gif_reply(
         self,
         peer_id: int,
         event: Any,
-        text: str,
+        command: Any,
+        message_data: dict[str, Any] | None,
         *,
         reply_to_cmid: int | None = None,
     ) -> None:
-        ogg_path: str | None = None
-        try:
-            ogg_path, tts_provider = text_to_voice_file(
-                text,
-                api_key=self._settings.ai_api_key,
-                base_url=self._settings.ai_base_url,
-                model=self._settings.ai_tts_model,
-                voice=self._voices.voice_id,
-                tts_base_url=self._settings.ai_tts_base_url,
-                tts_provider=self._settings.ai_tts_provider,
-            )
-            logger.info("Озвучка через %s", tts_provider)
-            send_voice_message(
-                self._vk,
-                self._vk_session,
+        query = self._resolve_gif_query(command, message_data)
+        gif_url, provider = search_gif(
+            query,
+            tenor_api_key=self._settings.tenor_api_key,
+            giphy_api_key=self._settings.giphy_api_key,
+            klipy_api_key=self._settings.klipy_api_key,
+        )
+        caption = f"Вот гифка, братан — {query[:50]}"
+        send_gif_url(
+            self._vk_session,
+            self._vk,
+            peer_id,
+            event,
+            gif_url,
+            caption=caption,
+            reply_to_cmid=reply_to_cmid,
+        )
+        logger.info("GIF через %s query=%r", provider, query[:80])
+
+    def _send_meme_reply(
+        self,
+        peer_id: int,
+        event: Any,
+        command: Any,
+        message_data: dict[str, Any] | None,
+        *,
+        reply_to_cmid: int | None = None,
+    ) -> None:
+        meme_bytes, top, bottom = build_meme(
+            message_data=message_data,
+            vk=self._vk,
+            raw_text=command.text,
+        )
+        caption = build_meme_caption(top, bottom)
+        send_image_bytes(
+            self._vk_session,
+            self._vk,
+            peer_id,
+            event,
+            meme_bytes,
+            caption=caption,
+            suffix=".jpg",
+            reply_to_cmid=reply_to_cmid,
+        )
+
+    def _send_quote_reply(
+        self,
+        peer_id: int,
+        event: Any,
+        message_data: dict[str, Any] | None,
+        *,
+        reply_to_cmid: int | None = None,
+        style: str = "",
+    ) -> None:
+        quote_bytes, quote = build_quote_image(
+            message_data=message_data,
+            vk=self._vk,
+            style=style,
+        )
+        send_image_bytes(
+            self._vk_session,
+            self._vk,
+            peer_id,
+            event,
+            quote_bytes,
+            caption="",
+            suffix=".png",
+            reply_to_cmid=reply_to_cmid,
+            as_document=False,
+        )
+        logger.info("Цитата style=%r: %s — %r", style, quote.author_name[:40], quote.text[:60])
+
+    async def _handle_narisuy(self, event: Any, command: Any) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        logger.info(
+            "Нарисуй chat_id=%s provider=%s prompt=%r",
+            chat_id,
+            command.provider,
+            command.prompt[:80],
+        )
+        await asyncio.to_thread(self._set_typing, peer_id)
+        await asyncio.to_thread(self._send_narisuy_reply, peer_id, event, command)
+
+    async def _handle_gif(self, event: Any, command: Any) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        message_data = _message_data(event)
+        reply_to_cmid: int | None = None
+        reply_msg = get_reply_message(message_data)
+        if reply_msg is not None:
+            reply_to_cmid = reply_message_conversation_id(reply_msg)
+        logger.info("Гиф chat_id=%s query=%r", chat_id, command.query[:80])
+        await asyncio.to_thread(self._set_typing, peer_id)
+        await asyncio.to_thread(
+            self._send_gif_reply,
+            peer_id,
+            event,
+            command,
+            message_data,
+            reply_to_cmid=reply_to_cmid,
+        )
+
+    async def _handle_meme(self, event: Any, command: Any) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        message_data = _message_data(event)
+        reply_to_cmid: int | None = None
+        reply_msg = get_reply_message(message_data)
+        if reply_msg is not None:
+            reply_to_cmid = reply_message_conversation_id(reply_msg)
+        logger.info("Мем chat_id=%s text=%r", chat_id, command.text[:80])
+        await asyncio.to_thread(self._set_typing, peer_id)
+        await asyncio.to_thread(
+            self._send_meme_reply,
+            peer_id,
+            event,
+            command,
+            message_data,
+            reply_to_cmid=reply_to_cmid,
+        )
+
+    async def _handle_quote(self, event: Any, command: Any) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        message_data = _message_data(event)
+        reply_msg = get_reply_message(message_data)
+        if reply_msg is None:
+            logger.info("Цитата без reply chat_id=%s", chat_id)
+            await asyncio.to_thread(
+                self.reply,
                 peer_id,
+                "Ответь на сообщение человека с текстом — потом «артем цитата».",
                 event,
-                ogg_path,
-                reply_to_cmid=reply_to_cmid,
             )
-        finally:
-            if ogg_path:
-                try:
-                    os.remove(ogg_path)
-                except OSError:
-                    logger.debug("Не удалось удалить временный TTS-файл %s", ogg_path)
+            return
+        reply_to_cmid = reply_message_conversation_id(reply_msg)
+        logger.info("Цитата chat_id=%s", chat_id)
+        await asyncio.to_thread(self._set_typing, peer_id)
+        await asyncio.to_thread(
+            self._send_quote_reply,
+            peer_id,
+            event,
+            message_data,
+            reply_to_cmid=reply_to_cmid,
+            style=command.style,
+        )
 
     async def _handle_weather(self, event: Any) -> None:
         peer_id = event.peer_id
@@ -782,38 +933,6 @@ class VkDmBot:
                 event,
             )
 
-    async def _handle_vgs(self, event: Any) -> None:
-        peer_id = event.peer_id
-        chat_id = event.chat_id
-        text = (event.text or "").strip()
-        logger.info("Обработка /вгс chat_id=%s text=%r", chat_id, text[:120])
-
-        try:
-            await asyncio.to_thread(
-                process_vgs_command,
-                self._vk_session,
-                self._vk,
-                peer_id,
-                event,
-                _message_data(event),
-            )
-            logger.info("Голосовое отправлено chat_id=%s", chat_id)
-        except LookupError as exc:
-            await asyncio.to_thread(self.reply, peer_id, str(exc), event)
-        except RuntimeError as exc:
-            await asyncio.to_thread(self.reply, peer_id, str(exc), event)
-        except ApiError as exc:
-            logger.exception("VK API /вгс chat_id=%s", chat_id)
-            await asyncio.to_thread(self.reply, peer_id, f"VK не принял голосовое: {exc}", event)
-        except Exception:
-            logger.exception("Ошибка /вгс chat_id=%s", chat_id)
-            await asyncio.to_thread(
-                self.reply,
-                peer_id,
-                "Не смог сделать голосовое. Ответь на видео или приложи его к /вгс.",
-                event,
-            )
-
     def _resolve_access_target(self, event: Any, text: str, command: AccessCommand) -> int | None:
         target_id = reply_author_id(event)
         if target_id and target_id > 0:
@@ -874,18 +993,6 @@ class VkDmBot:
         else:
             report = format_models_status(self._models.text_model, self._models.vision_model)
 
-        await asyncio.to_thread(self.reply, peer_id, report, event)
-
-    async def _handle_voice(self, event: Any, *, prompt: str | None = None) -> None:
-        peer_id = event.peer_id
-        chat_id = event.chat_id
-        text = prompt if prompt is not None else (event.text or "").strip()
-        command = parse_voice_command(text)
-        if command is None:
-            return
-
-        logger.info("Обработка голоса chat_id=%s action=%s", chat_id, command.action)
-        report = apply_voice_command(command, self._voices)
         await asyncio.to_thread(self.reply, peer_id, report, event)
 
     async def _handle_delete(self, event: Any) -> None:
@@ -990,17 +1097,45 @@ class VkDmBot:
             logger.info("Пропуск (нет префикса %r) chat_id=%s: %r", TRIGGER_PREFIX, chat_id, text[:80])
             return
 
-        cleaned_prompt, want_tts = split_prompt_flags(prompt)
-        if is_artem_voice_command(cleaned_prompt):
-            if outgoing_trigger:
-                await self._handle_voice(event, prompt=cleaned_prompt)
-            else:
-                command = parse_voice_command(cleaned_prompt)
-                if command and command.action in ("show", "list"):
-                    report = apply_voice_command(command, self._voices)
+        cleaned_prompt = strip_tts_keyword(prompt)
+
+        narisuy_cmd = parse_narisuy_command(cleaned_prompt)
+        gif_cmd = parse_gif_command(cleaned_prompt)
+        meme_cmd = parse_meme_command(cleaned_prompt)
+        quote_cmd = parse_quote_command(cleaned_prompt)
+        if (
+            narisuy_cmd is not None
+            or gif_cmd is not None
+            or meme_cmd is not None
+            or quote_cmd is not None
+        ):
+            if not outgoing_trigger:
+                if user_id == self._my_user_id:
+                    return
+                if not self._access.has_access(peer_id, user_id):
+                    logger.info("Пропуск (нет доступа) media chat_id=%s user_id=%s", chat_id, user_id)
+                    return
+            try:
+                if narisuy_cmd is not None:
+                    await self._handle_narisuy(event, narisuy_cmd)
+                elif gif_cmd is not None:
+                    await self._handle_gif(event, gif_cmd)
+                elif meme_cmd is not None:
+                    await self._handle_meme(event, meme_cmd)
+                elif quote_cmd is not None:
+                    await self._handle_quote(event, quote_cmd)
+                if not outgoing_trigger and user_id != self._my_user_id:
+                    self._access.consume(peer_id, user_id)
+            except RuntimeError as exc:
+                logger.warning("Media-команда chat_id=%s: %s", chat_id, exc)
+                await asyncio.to_thread(self.reply, peer_id, str(exc), event)
+            except Exception:
+                logger.exception("Ошибка media-команды chat_id=%s", chat_id)
+                if quote_cmd is not None:
+                    fail_text = "Не вышло отправить цитату в VK — подожди пару сек и попробуй снова."
                 else:
-                    report = "Менять голос может только владелец: /голос дмитрий"
-                await asyncio.to_thread(self.reply, peer_id, report, event)
+                    fail_text = "Не вышло — нет фото, не тот формат или генератор лагает. Проверь /инфо."
+                await asyncio.to_thread(self.reply, peer_id, fail_text, event)
             return
 
         kratko_cmd = parse_kratko_command(cleaned_prompt)
@@ -1044,7 +1179,6 @@ class VkDmBot:
                 return
             reply_to_cmid = reply_to_user.reply_cmid
             ai_prompt = spor_cmd.extra or "спорь с ним — жёстко, не соглашайся"
-            want_tts = True
             logger.info(
                 "Режим спорь chat_id=%s target=%s cmid=%s text=%r",
                 chat_id,
@@ -1076,7 +1210,6 @@ class VkDmBot:
                 reply_to_cmid,
                 reply_to_user.replied_text[:80],
             )
-            want_tts = True
             delete_owner_trigger = outgoing_trigger
 
         if outgoing_trigger:
@@ -1199,50 +1332,19 @@ class VkDmBot:
             reply = "Сейчас не отвечаю — не трать моё и своё время."
 
         try:
-            if want_tts:
-                try:
-                    await asyncio.to_thread(
-                        self._send_voice_reply,
-                        peer_id,
-                        event,
-                        reply,
-                        reply_to_cmid=reply_to_cmid,
-                    )
-                    logger.info(
-                        "Голосовой ответ отправлен в беседу chat_id=%s (%d символов)%s",
-                        chat_id,
-                        len(reply),
-                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
-                    )
-                except Exception:
-                    logger.exception("TTS не сработал chat_id=%s, отправляю текстом", chat_id)
-                    await asyncio.to_thread(
-                        self.reply,
-                        peer_id,
-                        reply,
-                        event,
-                        reply_to_cmid=reply_to_cmid,
-                    )
-                    logger.info(
-                        "Reply отправлен в беседу chat_id=%s (%d символов)%s",
-                        chat_id,
-                        len(reply),
-                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
-                    )
-            else:
-                await asyncio.to_thread(
-                    self.reply,
-                    peer_id,
-                    reply,
-                    event,
-                    reply_to_cmid=reply_to_cmid,
-                )
-                logger.info(
-                    "Reply отправлен в беседу chat_id=%s (%d символов)%s",
-                    chat_id,
-                    len(reply),
-                    f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
-                )
+            await asyncio.to_thread(
+                self.reply,
+                peer_id,
+                reply,
+                event,
+                reply_to_cmid=reply_to_cmid,
+            )
+            logger.info(
+                "Reply отправлен в беседу chat_id=%s (%d символов)%s",
+                chat_id,
+                len(reply),
+                f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+            )
             if not outgoing_trigger and user_id != self._my_user_id:
                 left = self._access.consume(peer_id, user_id)
                 if left is not None and left == 0:
@@ -1293,14 +1395,10 @@ class VkDmBot:
                 await self._handle_weather(event)
             elif kind == "ava":
                 await self._handle_ava(event)
-            elif kind == "vgs":
-                await self._handle_vgs(event)
             elif kind == "info":
                 await self._handle_info(event)
             elif kind == "ii":
                 await self._handle_ii(event)
-            elif kind == "voice":
-                await self._handle_voice(event)
             elif kind == "delete":
                 await self._handle_delete(event)
             elif kind == "dov":
