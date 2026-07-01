@@ -226,12 +226,100 @@ def log_tts_startup(tts_provider: str) -> None:
         edge_ok = "да"
     except ImportError:
         edge_ok = "нет"
+    try:
+        import omnivoice  # noqa: F401
+
+        omni_ok = "да"
+    except ImportError:
+        omni_ok = "нет"
     logger.info(
-        "TTS: режим=%s ffmpeg=%s edge-tts=%s",
+        "TTS: режим=%s ffmpeg=%s edge-tts=%s omnivoice=%s",
         tts_provider,
         ffmpeg or "нет",
         edge_ok,
+        omni_ok,
     )
+
+
+def wav_bytes_to_voice_ogg(wav_data: bytes) -> str:
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        try:
+            return _wav_to_ogg_ffmpeg(wav_data, ffmpeg)
+        except RuntimeError as exc:
+            logger.warning("ffmpeg WAV→OGG не удался (%s), пробую PyAV", exc)
+
+    try:
+        return _wav_to_ogg_pyav(wav_data)
+    except Exception as exc:
+        logger.warning("PyAV WAV→OGG не удался (%s)", exc)
+
+    raise RuntimeError(
+        "Нет ffmpeg для озвучки. Пересобери бота — в requirements.txt должен быть imageio-ffmpeg."
+    )
+
+
+def _wav_to_ogg_ffmpeg(wav_data: bytes, ffmpeg: str) -> str:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        wav_path = os.path.join(tmp_dir, "speech.wav")
+        ogg_path = os.path.join(tmp_dir, "voice.ogg")
+        Path(wav_path).write_bytes(wav_data)
+
+        command = [
+            ffmpeg,
+            "-y",
+            "-i",
+            wav_path,
+            "-t",
+            str(MAX_VOICE_SEC),
+            "-vn",
+            "-ac",
+            "1",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "32k",
+            "-application",
+            "voip",
+            "-ar",
+            "48000",
+            ogg_path,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            logger.error("ffmpeg OmniVoice stderr: %s", (result.stderr or "")[-500:])
+            raise RuntimeError("ffmpeg не сконвертировал OmniVoice в голосовое")
+
+        return _finalize_ogg_path(ogg_path)
+
+
+def _wav_to_ogg_pyav(wav_data: bytes) -> str:
+    import av
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ogg_path = os.path.join(tmp_dir, "voice.ogg")
+        input_container = av.open(io.BytesIO(wav_data))
+        output_container = av.open(ogg_path, mode="w", format="ogg")
+        output_stream = output_container.add_stream("libopus", rate=48000)
+        output_stream.layout = "mono"
+        output_stream.bit_rate = 32000
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=48000)
+
+        seconds = 0.0
+        for frame in input_container.decode(audio=0):
+            seconds += float(frame.samples) / float(frame.sample_rate or 1)
+            if seconds > MAX_VOICE_SEC:
+                break
+            for resampled in resampler.resample(frame):
+                resampled.pts = None
+                for packet in output_stream.encode(resampled):
+                    output_container.mux(packet)
+        for packet in output_stream.encode(None):
+            output_container.mux(packet)
+
+        output_container.close()
+        input_container.close()
+        return _finalize_ogg_path(ogg_path)
 
 
 def mp3_bytes_to_voice_ogg(mp3_data: bytes) -> str:
@@ -335,10 +423,30 @@ def text_to_voice_file(
     tts_base_url: str = "",
     tts_provider: str = "auto",
     allow_edge_fallback: bool = True,
+    omnivoice_model: str = "k2-fsa/OmniVoice",
+    omnivoice_instruct: str = "",
+    omnivoice_ref_audio: str = "",
+    omnivoice_ref_text: str = "",
+    omnivoice_language: str = "Russian",
 ) -> tuple[str, str]:
     speech_text = text_for_speech(text)
     openai_voice = resolve_openai_voice(voice)
     mode = (tts_provider or "auto").strip().lower()
+
+    if mode == "omnivoice":
+        from omnivoice_client import synthesize_omnivoice_wav
+
+        wav_data = synthesize_omnivoice_wav(
+            speech_text,
+            model_id=omnivoice_model,
+            voice_id=voice,
+            instruct=omnivoice_instruct,
+            ref_audio=omnivoice_ref_audio,
+            ref_text=omnivoice_ref_text,
+            language=omnivoice_language,
+        )
+        return wav_bytes_to_voice_ogg(wav_data), "omnivoice"
+
     mp3_data: bytes
     provider = "edge-tts"
 

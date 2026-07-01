@@ -32,6 +32,11 @@ class Settings:
     ai_tts_voice: str
     ai_tts_base_url: str
     ai_tts_provider: str
+    omnivoice_model: str
+    omnivoice_instruct: str
+    omnivoice_ref_audio: str
+    omnivoice_ref_text: str
+    omnivoice_language: str
     fusionbrain_api_key: str
     fusionbrain_secret_key: str
     stable_horde_api_key: str
@@ -114,7 +119,7 @@ def _load_vk_tokens() -> tuple[str, ...]:
 
 def _resolve_tts_provider() -> str:
     raw = os.getenv("AI_TTS_PROVIDER", "").strip().lower()
-    if raw in ("bothub", "edge", "auto"):
+    if raw in ("bothub", "edge", "auto", "omnivoice"):
         return raw
     if os.getenv("BOT_ID"):
         return "edge"
@@ -148,6 +153,11 @@ def load_settings() -> Settings:
     ai_tts_model = os.getenv("AI_TTS_MODEL", "tts-1-1106").strip()
     ai_tts_voice = os.getenv("AI_TTS_VOICE", "onyx").strip()
     ai_tts_base_url = os.getenv("AI_TTS_BASE_URL", "").strip()
+    omnivoice_model = os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip()
+    omnivoice_instruct = os.getenv("OMNIVOICE_INSTRUCT", "").strip()
+    omnivoice_ref_audio = os.getenv("OMNIVOICE_REF_AUDIO", "").strip()
+    omnivoice_ref_text = os.getenv("OMNIVOICE_REF_TEXT", "").strip()
+    omnivoice_language = os.getenv("OMNIVOICE_LANGUAGE", "Russian").strip()
     fusionbrain_api_key = os.getenv("FUSIONBRAIN_API_KEY", "").strip()
     fusionbrain_secret_key = os.getenv("FUSIONBRAIN_SECRET_KEY", "").strip()
     stable_horde_api_key = os.getenv("STABLE_HORDE_API_KEY", "").strip()
@@ -229,6 +239,11 @@ def load_settings() -> Settings:
         ai_tts_voice=ai_tts_voice,
         ai_tts_base_url=ai_tts_base_url,
         ai_tts_provider=ai_tts_provider,
+        omnivoice_model=omnivoice_model,
+        omnivoice_instruct=omnivoice_instruct,
+        omnivoice_ref_audio=omnivoice_ref_audio,
+        omnivoice_ref_text=omnivoice_ref_text,
+        omnivoice_language=omnivoice_language,
         fusionbrain_api_key=fusionbrain_api_key,
         fusionbrain_secret_key=fusionbrain_secret_key,
         stable_horde_api_key=stable_horde_api_key,

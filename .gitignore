@@ -2,6 +2,7 @@
 .lpbot.pid
 ai_access.json
 ai_models.json
+ai_prompts.json
 tts_voice.json
 data/
 user/

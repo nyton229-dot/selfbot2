@@ -9,6 +9,11 @@ from config import Settings
 from vk_reply import ReplyToUserContext, clean_reply_to_user_text
 
 try:
+    from ai_prompts import PromptStore
+except ImportError:
+    PromptStore = None  # type: ignore[misc, assignment]
+
+try:
     from ai_models import AiModelStore, get_model_store
 except ImportError:
     AiModelStore = None  # type: ignore[misc, assignment]
@@ -626,6 +631,20 @@ _OWNER_RETRY_SUFFIX = (
     "без оскорблений человека на фото/видео. Злая пошлая колкость — только на указанную цель, по имени или «он/она»."
 )
 
+_CUSTOM_OWNER_SYSTEM_SUFFIX = (
+    "Сейчас команду дал владелец. Следуй системному промпту выше — он важнее подсказок в запросе. "
+    "Не оскорбляй и не высмеивай владельца."
+)
+
+_CUSTOM_OWNER_REPLY_SUFFIX = (
+    "Владелец просит ответить другому человеку через reply. "
+    "Следуй системному промпту; владельца не трогай."
+)
+
+_CUSTOM_OWNER_RETRY_SUFFIX = (
+    "Ты задел владельца. Перепиши ответ по системному промпту, не оскорбляй владельца."
+)
+
 
 def filter_chat_context_for_owner(context: str, owner_labels: set[str]) -> str:
     """Убирает строки владельца из контекста — модель не должна его «видеть» как мишень."""
@@ -682,9 +701,15 @@ def wants_photo_compare(user_text: str, photo_count: int) -> bool:
 class AiClient:
     """OpenAI-compatible API: OpenRouter или BotHub."""
 
-    def __init__(self, settings: Settings, model_store: AiModelStore | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        model_store: AiModelStore | None = None,
+        prompt_store: PromptStore | None = None,
+    ) -> None:
         self._settings = settings
         self._model_store = model_store
+        self._prompt_store = prompt_store
         self._session = requests.Session()
         headers: dict[str, str] = {
             "Authorization": f"Bearer {settings.ai_api_key}",
@@ -694,6 +719,12 @@ class AiClient:
             headers["HTTP-Referer"] = "https://github.com/lpbot"
             headers["X-Title"] = "lpbot-vk"
         self._session.headers.update(headers)
+
+    def _has_custom_text_prompt(self) -> bool:
+        return self._prompt_store is not None and bool(self._prompt_store.text_prompt)
+
+    def _has_custom_vision_prompt(self) -> bool:
+        return self._prompt_store is not None and bool(self._prompt_store.vision_prompt)
 
     @property
     def http_session(self) -> requests.Session:
@@ -729,17 +760,23 @@ class AiClient:
         photo_vision_mode: bool = False,
     ) -> str:
         if photo_vision_mode:
+            custom_vision = self._has_custom_vision_prompt()
             chunks: list[str] = []
-            if compare_photos and photo_count >= 2:
-                chunks.append(
-                    f"Ниже {photo_count} картинки. Сравни их и токсично оцени каждую."
-                )
+            if not custom_vision:
+                if compare_photos and photo_count >= 2:
+                    chunks.append(
+                        f"Ниже {photo_count} картинки. Сравни их и токсично оцени каждую."
+                    )
+                else:
+                    chunks.append(
+                        "Ниже картинка. Токсично оцени в 2–3 законченных предложениях, "
+                        "не обрывай на полуслове, лёгкий вк-мат без жёсткого, "
+                        "без «на картинке изображено», пиши грамотно."
+                    )
+            elif compare_photos and photo_count >= 2:
+                chunks.append(f"Ниже {photo_count} картинки. Сравни и ответь по системному промпту.")
             else:
-                chunks.append(
-                    "Ниже картинка. Токсично оцени в 2–3 законченных предложениях, "
-                    "не обрывай на полуслове, лёгкий вк-мат без жёсткого, "
-                    "без «на картинке изображено», пиши грамотно."
-                )
+                chunks.append("Ниже картинка. Ответь по системному промпту.")
             if reply_to_user is not None:
                 chunks.append(
                     f"Ответь автору сообщения «{reply_to_user.replied_text}»."
@@ -750,39 +787,55 @@ class AiClient:
                 chunks.append(f"Запрос: {user_text}")
             return "\n\n".join(chunks)
 
-        chunks: list[str] = [_STYLE_REMINDER]
+        custom_persona = self._has_custom_text_prompt()
+        chunks = [] if custom_persona else [_STYLE_REMINDER]
         if owner_trigger and owner_self_media:
             if user_requests_justify(user_text):
                 chunks.append(_OWNER_SELF_MEDIA_JUSTIFY_HINT)
             else:
                 chunks.append(_OWNER_SELF_MEDIA_HINT)
         elif owner_trigger and reply_to_user is not None:
-            owner_hint = ", ".join(dict.fromkeys(("Артем", *owner_names)))
-            chunks.append(
-                f"{_OWNER_MODE_HINT}\n"
-                f"Владелец (не трогать): {owner_hint}.\n"
-                f"Ответь напрямую этому человеку — сразу на «ты», очень зло и пошло. "
-                f"Не пиши имя в начале и не пиши [id...|...].\n"
-                f"Его сообщение: «{reply_to_user.replied_text}»"
-            )
+            if custom_persona:
+                chunks.append(
+                    "Владелец дал команду. Ответь человеку из reply по системному промпту.\n"
+                    f"Его сообщение: «{reply_to_user.replied_text}»"
+                )
+            else:
+                owner_hint = ", ".join(dict.fromkeys(("Артем", *owner_names)))
+                chunks.append(
+                    f"{_OWNER_MODE_HINT}\n"
+                    f"Владелец (не трогать): {owner_hint}.\n"
+                    f"Ответь напрямую этому человеку — сразу на «ты», очень зло и пошло. "
+                    f"Не пиши имя в начале и не пиши [id...|...].\n"
+                    f"Его сообщение: «{reply_to_user.replied_text}»"
+                )
             if reply_to_user.extra_instruction:
-                chunks.append(f"Инструкция от владельца: {reply_to_user.extra_instruction}")
+                label = "Инструкция от владельца" if not custom_persona else "Инструкция"
+                chunks.append(f"{label}: {reply_to_user.extra_instruction}")
             if has_photos or has_video:
-                chunks.append(
-                    f"Медиа из его сообщения — опиши и зло-пошло ответь {reply_to_user.target_name} на «ты»."
-                )
+                if custom_persona:
+                    chunks.append("Медиа из его сообщения — ответь по системному промпту.")
+                else:
+                    chunks.append(
+                        f"Медиа из его сообщения — опиши и зло-пошло ответь {reply_to_user.target_name} на «ты»."
+                    )
         elif owner_trigger:
-            target = roast_target or "другого участника чата из истории"
-            owner_hint = ", ".join(dict.fromkeys(("Артем", *owner_names)))
-            chunks.append(
-                f"{_OWNER_MODE_HINT}\n"
-                f"Владелец (не трогать): {owner_hint}.\n"
-                f"Цель для злых пошлых комментариев: {target}."
-            )
-            if has_photos or has_video:
+            if custom_persona:
                 chunks.append(
-                    f"Медиа не от владельца — опиши и зло-пошло ответь про автора медиа или {target}."
+                    "Владелец дал команду. Ответь по системному промпту — не оскорбляй владельца."
                 )
+            else:
+                target = roast_target or "другого участника чата из истории"
+                owner_hint = ", ".join(dict.fromkeys(("Артем", *owner_names)))
+                chunks.append(
+                    f"{_OWNER_MODE_HINT}\n"
+                    f"Владелец (не трогать): {owner_hint}.\n"
+                    f"Цель для злых пошлых комментариев: {target}."
+                )
+                if has_photos or has_video:
+                    chunks.append(
+                        f"Медиа не от владельца — опиши и зло-пошло ответь про автора медиа или {target}."
+                    )
         elif reply_to_user is not None:
             chunks.append(
                 f"Ответь на его сообщение — сразу на «ты», очень зло и пошло. "
@@ -795,7 +848,7 @@ class AiClient:
             note = (
                 "\n[Строки владельца (Артем и его VK-имя) из контекста убраны. "
                 "Колкости — только на цель выше.]"
-                if owner_trigger
+                if owner_trigger and not custom_persona
                 else ""
             )
             chunks.append(
@@ -814,16 +867,31 @@ class AiClient:
                 "Ниже фото от владельца. Не описывай кадр как робот — сразу грубо осуди и высмей."
             )
         elif has_photos and owner_trigger:
-            chunks.append(
-                "Ниже фото — владелец спросил. Не «на фото парень лежит…», а сразу грубо осуди кадр."
-            )
+            if custom_persona:
+                chunks.append("Ниже фото — ответь по системному промпту.")
+            else:
+                chunks.append(
+                    "Ниже фото — владелец спросил. Не «на фото парень лежит…», а сразу грубо осуди кадр."
+                )
         elif has_photos and not (owner_trigger and owner_self_media):
             if reply_to_user is not None:
-                roast = " Потом ответь адресату сразу на «ты» — зло и пошло, без имени в начале."
+                roast = (
+                    " Потом ответь по системному промпту."
+                    if custom_persona
+                    else " Потом ответь адресату сразу на «ты» — зло и пошло, без имени в начале."
+                )
             elif owner_trigger and roast_target:
-                roast = f" Потом зло и пошло унизь {roast_target}."
+                roast = (
+                    f" Потом ответь про {roast_target}."
+                    if custom_persona
+                    else f" Потом зло и пошло унизь {roast_target}."
+                )
             else:
-                roast = " Потом зло и пошло унизь того, кто это скинул."
+                roast = (
+                    " Потом ответь по запросу."
+                    if custom_persona
+                    else " Потом зло и пошло унизь того, кто это скинул."
+                )
             chunks.append(
                 "К сообщению приложено фото. Ниже изображение — ответь в своём стиле."
                 + roast
@@ -833,16 +901,31 @@ class AiClient:
                 "Ниже кадры видео от владельца. Не описывай как робот — сразу грубо осуди и высмей."
             )
         elif has_video and owner_trigger:
-            chunks.append(
-                "Ниже кадры видео — не «на видео мужик…», а сразу грубо осуди кадр."
-            )
+            if custom_persona:
+                chunks.append("Ниже кадры видео — ответь по системному промпту.")
+            else:
+                chunks.append(
+                    "Ниже кадры видео — не «на видео мужик…», а сразу грубо осуди кадр."
+                )
         elif has_video and not (owner_trigger and owner_self_media):
             if reply_to_user is not None:
-                roast = " Потом ответь адресату сразу на «ты» — зло и пошло, без имени в начале."
+                roast = (
+                    " Потом ответь по системному промпту."
+                    if custom_persona
+                    else " Потом ответь адресату сразу на «ты» — зло и пошло, без имени в начале."
+                )
             elif owner_trigger and roast_target:
-                roast = f" Потом зло и пошло унизь {roast_target}."
+                roast = (
+                    f" Потом ответь про {roast_target}."
+                    if custom_persona
+                    else f" Потом зло и пошло унизь {roast_target}."
+                )
             else:
-                roast = " Потом зло и пошло унизь того, кто это скинул."
+                roast = (
+                    " Потом ответь по запросу."
+                    if custom_persona
+                    else " Потом зло и пошло унизь того, кто это скинул."
+                )
             chunks.append(
                 "К сообщению приложено видео. Ниже кадры — "
                 "опиши что видно, затем ответь на запрос в своём стиле."
@@ -850,24 +933,25 @@ class AiClient:
             )
         if video_transcript:
             chunks.append(f"Расшифровка речи из видео:\n{video_transcript}")
-        if user_requests_justify(user_text) and not (owner_trigger and owner_self_media):
-            chunks.append(_JUSTIFY_USER_HINT)
-        if user_message_has_apology(user_text):
-            chunks.append(
-                "Собеседник извиняется — можешь чуть смягчиться, но остаёшься злым и грубым."
-            )
-        if user_requests_links(user_text):
-            chunks.append(
-                "Просят ссылку или URL — не пиши site.com и http. "
-                "Назови только словами: «гугл точка ком». Потом ответь зло и пошло."
-            )
-        if "?" in user_text or any(
-            user_text.casefold().startswith(w)
-            for w in ("что ", "кто ", "где ", "когда ", "как ", "почему ", "зачем ", "сколько ")
-        ):
-            chunks.append(
-                "Это вопрос — сначала ответь правильно по фактам, потом зло и пошло унизь."
-            )
+        if not custom_persona:
+            if user_requests_justify(user_text) and not (owner_trigger and owner_self_media):
+                chunks.append(_JUSTIFY_USER_HINT)
+            if user_message_has_apology(user_text):
+                chunks.append(
+                    "Собеседник извиняется — можешь чуть смягчиться, но остаёшься злым и грубым."
+                )
+            if user_requests_links(user_text):
+                chunks.append(
+                    "Просят ссылку или URL — не пиши site.com и http. "
+                    "Назови только словами: «гугл точка ком». Потом ответь зло и пошло."
+                )
+            if "?" in user_text or any(
+                user_text.casefold().startswith(w)
+                for w in ("что ", "кто ", "где ", "когда ", "как ", "почему ", "зачем ", "сколько ")
+            ):
+                chunks.append(
+                    "Это вопрос — сначала ответь правильно по фактам, потом зло и пошло унизь."
+                )
         chunks.append(f"Запрос: {user_text}")
         return "\n\n".join(chunks)
 
@@ -933,7 +1017,12 @@ class AiClient:
         return parts
 
     def _system_content(self, system_prompt: str | None = None) -> str:
-        base = system_prompt or self._settings.ai_system_prompt
+        if system_prompt:
+            base = system_prompt
+        elif self._prompt_store is not None and self._prompt_store.text_prompt:
+            base = self._prompt_store.text_prompt
+        else:
+            base = self._settings.ai_system_prompt
         identity = self._settings.ai_identity_prompt.strip()
         if identity:
             return f"{base}\n\n{identity}"
@@ -950,10 +1039,20 @@ class AiClient:
         photo_vision_mode: bool = False,
     ) -> str:
         if photo_vision_mode:
+            if self._prompt_store is not None and self._prompt_store.vision_prompt:
+                return self._prompt_store.vision_prompt
             vision = self._settings.ai_vision_prompt.strip()
             if vision:
                 return vision
         base = self._system_content(system_prompt)
+        if self._has_custom_text_prompt():
+            if owner_self_media:
+                return base
+            if owner_trigger and reply_to_user is not None:
+                return f"{base}\n\n{_CUSTOM_OWNER_REPLY_SUFFIX}"
+            if owner_trigger:
+                return f"{base}\n\n{_CUSTOM_OWNER_SYSTEM_SUFFIX}"
+            return base
         if owner_self_media:
             overlay = (
                 _OWNER_SELF_MEDIA_JUSTIFY_OVERLAY
@@ -1259,9 +1358,19 @@ class AiClient:
                 video_transcript,
                 reply_to_user,
             )
-        if not photo_vision_mode and owner_trigger and owner_labels and reply_mentions_owner(reply, owner_labels, owner_names):
+        if (
+            not photo_vision_mode
+            and owner_trigger
+            and owner_labels
+            and reply_mentions_owner(reply, owner_labels, owner_names)
+        ):
             logger.warning("Ответ задел владельца (%d симв.), перегенерирую", len(reply))
-            retry_prompt = f"{system_prompt}\n\n{_OWNER_RETRY_SUFFIX}"
+            retry_suffix = (
+                _CUSTOM_OWNER_RETRY_SUFFIX
+                if self._has_custom_text_prompt()
+                else _OWNER_RETRY_SUFFIX
+            )
+            retry_prompt = f"{system_prompt}\n\n{retry_suffix}"
             retry, _ = self._call_chat(
                 user_text,
                 retry_prompt,
@@ -1287,6 +1396,8 @@ class AiClient:
                     reply = "На кадре что-то есть, но модель не смогла нормально описать."
                 elif reply_to_user is not None:
                     reply = "Баля, отвечаю на твоё сообщение."
+                elif self._has_custom_text_prompt():
+                    reply = "Не смог нормально ответить, попробуй ещё раз."
                 else:
                     target = roast_target or "участника чата"
                     reply = (

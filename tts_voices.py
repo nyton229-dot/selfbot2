@@ -22,6 +22,15 @@ TTS_VOICES: tuple[tuple[str, str, str, str], ...] = (
     ("айгуль", "Айгуль — женский казахский", "fable", "kk-KZ-AigulNeural"),
 )
 
+OMNIVOICE_INSTRUCTS: dict[str, str] = {
+    "дмитрий": "male, young adult, moderate pitch, russian accent",
+    "светлана": "female, young adult, moderate pitch, russian accent",
+    "остап": "male, young adult, moderate pitch, russian accent",
+    "полина": "female, young adult, moderate pitch, russian accent",
+    "даулет": "male, young adult, moderate pitch, russian accent",
+    "айгуль": "female, young adult, moderate pitch, russian accent",
+}
+
 # Старые id из прошлой версии списка
 _LEGACY_VOICE_ALIASES: dict[str, str] = {
     "артём": "остап",
@@ -105,6 +114,11 @@ def resolve_edge_voice(voice_id: str) -> str:
     if entry is None:
         return "ru-RU-DmitryNeural"
     return entry[3]
+
+
+def resolve_omnivoice_instruct(voice_id: str) -> str:
+    resolved = resolve_voice_id(voice_id) or voice_id.strip().casefold()
+    return OMNIVOICE_INSTRUCTS.get(resolved, "male, young adult, moderate pitch, russian accent")
 
 
 def voice_label(voice_id: str) -> str:

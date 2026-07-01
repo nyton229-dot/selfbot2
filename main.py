@@ -31,6 +31,12 @@ from ai_models import (
     is_ii_command,
     parse_ii_command,
 )
+from ai_prompts import (
+    apply_prompt_command,
+    init_prompt_store,
+    is_prompt_command,
+    parse_prompt_command,
+)
 from ai_access import (
     AccessCommand,
     AiAccessStore,
@@ -52,6 +58,15 @@ from horde_client import generate_image as generate_horde_image
 from instance_lock import acquire_instance_lock, release_instance_lock
 from meme_client import build_meme
 from quote_client import build_quote_image
+from tts_client import log_tts_startup, text_to_voice_file
+from tts_voices import (
+    apply_voice_command,
+    init_voice_store,
+    is_artem_voice_command,
+    is_voice_command,
+    parse_voice_command,
+    voice_label,
+)
 from video_transcribe import should_transcribe_video, transcribe_videos_in_message
 from vk_avatar import (
     fetch_user_avatar,
@@ -86,8 +101,9 @@ from vk_text_cmds import (
     parse_narisuy_command,
     parse_quote_command,
     parse_spor_command,
-    strip_tts_keyword,
+    split_prompt_flags,
 )
+from vk_voice import send_voice_message
 from vk_media import (
     count_photos,
     load_message_images,
@@ -255,6 +271,23 @@ def should_queue_ii_event(event: Any) -> bool:
     return is_ii_command((event.text or "").strip())
 
 
+def should_queue_prompt_event(event: Any) -> bool:
+    """Команда /промпт — смена системного промпта, только от владельца."""
+    if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
+        return False
+    if not event.from_me:
+        return False
+    return is_prompt_command((event.text or "").strip())
+
+
+def should_queue_voice_event(event: Any) -> bool:
+    """Команда /голос — смена голоса озвучки, только от владельца."""
+    if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
+        return False
+    if not event.from_me:
+        return False
+    return is_voice_command((event.text or "").strip())
+
 
 def should_queue_dov_list_event(event: Any) -> bool:
     """Команда /дов — список участников с доступом к ИИ."""
@@ -337,6 +370,10 @@ def _handle_longpoll_event(
         kind = "info"
     elif should_queue_ii_event(event):
         kind = "ii"
+    elif should_queue_prompt_event(event):
+        kind = "prompt"
+    elif should_queue_voice_event(event):
+        kind = "voice"
     elif should_queue_delete_event(event):
         kind = "delete"
     elif should_queue_dov_list_event(event):
@@ -415,7 +452,16 @@ class VkDmBot:
             settings.ai_model,
             settings.ai_vision_model,
         )
-        self._ai = AiClient(settings, self._models)
+        self._prompts = init_prompt_store(
+            _account_store_path("ai_prompts", account_id, multi_account),
+            default_text=settings.ai_system_prompt,
+            default_vision=settings.ai_vision_prompt,
+        )
+        self._ai = AiClient(settings, self._models, self._prompts)
+        self._voices = init_voice_store(
+            _account_store_path("tts_voice", account_id, multi_account),
+            settings.ai_tts_voice,
+        )
 
         self._vk_session = vk_api.VkApi(token=vk_token)
         self._vk = self._vk_session.get_api()
@@ -428,12 +474,15 @@ class VkDmBot:
             self._my_user_id,
         )
         self._user_names: dict[int, str] = {}
+        log_tts_startup(settings.ai_tts_provider)
         logger.info(
-            "Акк %s: AI provider=%s text_model=%s vision_model=%s",
+            "Акк %s: AI provider=%s text_model=%s vision_model=%s tts=%s voice=%s",
             account_id,
             settings.ai_provider,
             self._models.text_model,
             self._models.vision_model,
+            settings.ai_tts_provider,
+            voice_label(self._voices.voice_id),
         )
 
     def _init_owner_account(self) -> int:
@@ -624,6 +673,46 @@ class VkDmBot:
                 peer_id,
                 error,
             )
+
+    def _send_voice_reply(
+        self,
+        peer_id: int,
+        event: Any,
+        text: str,
+        *,
+        reply_to_cmid: int | None = None,
+    ) -> None:
+        ogg_path: str | None = None
+        try:
+            ogg_path, tts_provider = text_to_voice_file(
+                text,
+                api_key=self._settings.ai_api_key,
+                base_url=self._settings.ai_base_url,
+                model=self._settings.ai_tts_model,
+                voice=self._voices.voice_id,
+                tts_base_url=self._settings.ai_tts_base_url,
+                tts_provider=self._settings.ai_tts_provider,
+                omnivoice_model=self._settings.omnivoice_model,
+                omnivoice_instruct=self._settings.omnivoice_instruct,
+                omnivoice_ref_audio=self._settings.omnivoice_ref_audio,
+                omnivoice_ref_text=self._settings.omnivoice_ref_text,
+                omnivoice_language=self._settings.omnivoice_language,
+            )
+            logger.info("Озвучка через %s", tts_provider)
+            send_voice_message(
+                self._vk,
+                self._vk_session,
+                peer_id,
+                event,
+                ogg_path,
+                reply_to_cmid=reply_to_cmid,
+            )
+        finally:
+            if ogg_path:
+                try:
+                    os.remove(ogg_path)
+                except OSError:
+                    logger.debug("Не удалось удалить временный TTS-файл %s", ogg_path)
 
     def _fusionbrain_configured(self) -> bool:
         return bool(
@@ -995,6 +1084,42 @@ class VkDmBot:
 
         await asyncio.to_thread(self.reply, peer_id, report, event)
 
+    async def _handle_prompt(self, event: Any) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        text = (event.text or "").strip()
+        command = parse_prompt_command(text)
+        if command is None:
+            return
+
+        logger.info("Обработка /промпт chat_id=%s action=%s target=%s", chat_id, command.action, command.target)
+        reply_msg = get_reply_message(_message_data(event))
+        reply_source = reply_message_text(reply_msg) if reply_msg is not None else None
+        try:
+            report = apply_prompt_command(
+                self._prompts,
+                command,
+                default_text=self._settings.ai_system_prompt,
+                default_vision=self._settings.ai_vision_prompt,
+                reply_text=reply_source,
+            )
+        except ValueError as exc:
+            report = str(exc)
+
+        await asyncio.to_thread(self.reply, peer_id, report, event)
+
+    async def _handle_voice(self, event: Any, *, prompt: str | None = None) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        text = prompt if prompt is not None else (event.text or "").strip()
+        command = parse_voice_command(text)
+        if command is None:
+            return
+
+        logger.info("Обработка голоса chat_id=%s action=%s", chat_id, command.action)
+        report = apply_voice_command(command, self._voices)
+        await asyncio.to_thread(self.reply, peer_id, report, event)
+
     async def _handle_delete(self, event: Any) -> None:
         peer_id = event.peer_id
         chat_id = event.chat_id
@@ -1097,7 +1222,43 @@ class VkDmBot:
             logger.info("Пропуск (нет префикса %r) chat_id=%s: %r", TRIGGER_PREFIX, chat_id, text[:80])
             return
 
-        cleaned_prompt = strip_tts_keyword(prompt)
+        cleaned_prompt, want_tts = split_prompt_flags(prompt)
+        prompt_cmd = parse_prompt_command(cleaned_prompt)
+        if prompt_cmd is not None:
+            if not outgoing_trigger:
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    "Менять промпт может только владелец: /промпт …",
+                    event,
+                )
+                return
+            reply_msg = get_reply_message(message_data)
+            reply_source = reply_message_text(reply_msg) if reply_msg is not None else None
+            try:
+                report = apply_prompt_command(
+                    self._prompts,
+                    prompt_cmd,
+                    default_text=self._settings.ai_system_prompt,
+                    default_vision=self._settings.ai_vision_prompt,
+                    reply_text=reply_source,
+                )
+            except ValueError as exc:
+                report = str(exc)
+            await asyncio.to_thread(self.reply, peer_id, report, event)
+            return
+
+        if is_artem_voice_command(cleaned_prompt):
+            if outgoing_trigger:
+                await self._handle_voice(event, prompt=cleaned_prompt)
+            else:
+                command = parse_voice_command(cleaned_prompt)
+                if command and command.action in ("show", "list"):
+                    report = apply_voice_command(command, self._voices)
+                else:
+                    report = "Менять голос может только владелец: /голос дмитрий"
+                await asyncio.to_thread(self.reply, peer_id, report, event)
+            return
 
         narisuy_cmd = parse_narisuy_command(cleaned_prompt)
         gif_cmd = parse_gif_command(cleaned_prompt)
@@ -1179,6 +1340,7 @@ class VkDmBot:
                 return
             reply_to_cmid = reply_to_user.reply_cmid
             ai_prompt = spor_cmd.extra or "спорь с ним — жёстко, не соглашайся"
+            want_tts = True
             logger.info(
                 "Режим спорь chat_id=%s target=%s cmid=%s text=%r",
                 chat_id,
@@ -1210,6 +1372,7 @@ class VkDmBot:
                 reply_to_cmid,
                 reply_to_user.replied_text[:80],
             )
+            want_tts = True
             delete_owner_trigger = outgoing_trigger
 
         if outgoing_trigger:
@@ -1332,19 +1495,50 @@ class VkDmBot:
             reply = "Сейчас не отвечаю — не трать моё и своё время."
 
         try:
-            await asyncio.to_thread(
-                self.reply,
-                peer_id,
-                reply,
-                event,
-                reply_to_cmid=reply_to_cmid,
-            )
-            logger.info(
-                "Reply отправлен в беседу chat_id=%s (%d символов)%s",
-                chat_id,
-                len(reply),
-                f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
-            )
+            if want_tts:
+                try:
+                    await asyncio.to_thread(
+                        self._send_voice_reply,
+                        peer_id,
+                        event,
+                        reply,
+                        reply_to_cmid=reply_to_cmid,
+                    )
+                    logger.info(
+                        "Голосовой ответ отправлен в беседу chat_id=%s (%d символов)%s",
+                        chat_id,
+                        len(reply),
+                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                    )
+                except Exception:
+                    logger.exception("TTS не сработал chat_id=%s, отправляю текстом", chat_id)
+                    await asyncio.to_thread(
+                        self.reply,
+                        peer_id,
+                        reply,
+                        event,
+                        reply_to_cmid=reply_to_cmid,
+                    )
+                    logger.info(
+                        "Reply отправлен в беседу chat_id=%s (%d символов)%s",
+                        chat_id,
+                        len(reply),
+                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                    )
+            else:
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    reply,
+                    event,
+                    reply_to_cmid=reply_to_cmid,
+                )
+                logger.info(
+                    "Reply отправлен в беседу chat_id=%s (%d символов)%s",
+                    chat_id,
+                    len(reply),
+                    f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                )
             if not outgoing_trigger and user_id != self._my_user_id:
                 left = self._access.consume(peer_id, user_id)
                 if left is not None and left == 0:
@@ -1399,6 +1593,10 @@ class VkDmBot:
                 await self._handle_info(event)
             elif kind == "ii":
                 await self._handle_ii(event)
+            elif kind == "prompt":
+                await self._handle_prompt(event)
+            elif kind == "voice":
+                await self._handle_voice(event)
             elif kind == "delete":
                 await self._handle_delete(event)
             elif kind == "dov":

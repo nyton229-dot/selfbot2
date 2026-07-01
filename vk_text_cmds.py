@@ -23,7 +23,7 @@ _IMAGE_STYLE_SUFFIX = ", meme style, funny, dramatic, high contrast"
 
 _SPOR_MODE_HINT = (
     "Режим «спорь»: жёстко спорь, не соглашайся, ломай его аргументы. "
-    "Коротко 2–4 предложения."
+    "Коротко 2–4 предложения — ответ пойдёт голосом."
 )
 
 
@@ -177,16 +177,20 @@ def build_kratko_prompt(source_text: str, extra: str = "") -> str:
 
 
 def strip_tts_keyword(prompt: str) -> str:
-    """Убирает «озвучь» из запроса (озвучка отключена)."""
-    stripped = prompt.strip()
-    if not stripped:
-        return ""
-
-    cleaned = _TTS_WORD_RE.sub(" ", stripped)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:-—")
+    """Убирает «озвучь» из запроса, оставляя текст для ИИ."""
+    cleaned, _ = split_prompt_flags(prompt)
     return cleaned
 
 
 def split_prompt_flags(prompt: str) -> tuple[str, bool]:
-    """Совместимость: озвучка отключена, всегда возвращает want_tts=False."""
-    return strip_tts_keyword(prompt), False
+    """Убирает «озвучь» из запроса и возвращает флаг TTS."""
+    stripped = prompt.strip()
+    if not stripped:
+        return "", False
+
+    want_tts = bool(_TTS_WORD_RE.search(stripped))
+    cleaned = _TTS_WORD_RE.sub(" ", stripped)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:-—")
+    if want_tts and not cleaned:
+        cleaned = "скажи что-нибудь злое"
+    return cleaned, want_tts
