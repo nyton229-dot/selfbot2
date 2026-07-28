@@ -21,6 +21,22 @@ MAX_VIDEO_BYTES = 25 * 1024 * 1024
 _AI_PHOTO_MAX_WIDTH = 807
 _FRAME_RATIOS = (0.1, 0.35, 0.65, 0.9)
 
+_VK_MEDIA_HEADERS = {
+    "Referer": "https://vk.com/",
+    "Origin": "https://vk.com",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def _media_request_headers(url: str) -> dict[str, str] | None:
+    lower = url.casefold()
+    if any(host in lower for host in ("okcdn.ru", "vkuserphoto", "userapi.com", "vk.ru", "vk.com")):
+        return _VK_MEDIA_HEADERS
+    return None
+
 
 def _iter_media_attachment_lists(message_data: dict[str, Any] | None) -> list[list[dict[str, Any]]]:
     """Вложения: сначала из сообщения, затем из reply_message."""
@@ -249,17 +265,9 @@ def _is_valid_video_file(path: str) -> bool:
         size = os.path.getsize(path)
     except OSError:
         return False
-    if size < 1024:
-        return False
     with open(path, "rb") as file:
         head = file.read(16)
-    if len(head) >= 8 and head[4:8] == b"ftyp":
-        return True
-    if head[:4] == b"\x1aE\xdf\xa3":
-        return True
-    if head.startswith(b"RIFF") and b"AVI" in head:
-        return True
-    return False
+    return _is_valid_video_file_content(head, size)
 
 
 def _download_video_url(
@@ -436,13 +444,35 @@ def _frame_seconds(duration: int) -> tuple[float, ...]:
 
 def _download_mp4(session: requests.Session, mp4_url: str, tmp_dir: str) -> str | None:
     video_path = os.path.join(tmp_dir, "video.mp4")
-    content = session.get(mp4_url, timeout=120).content
+    headers = _media_request_headers(mp4_url) or {}
+    try:
+        response = session.get(mp4_url, timeout=120, headers=headers)
+        response.raise_for_status()
+        content = response.content
+    except Exception:
+        logger.exception("Не удалось скачать mp4: %s", mp4_url[:80])
+        return None
     if len(content) > MAX_VIDEO_BYTES:
         logger.warning("Видео слишком большое: %d байт", len(content))
+        return None
+    if not _is_valid_video_file_content(content[:16], len(content)):
+        logger.warning("mp4 по ссылке не похож на видео: %s", mp4_url[:80])
         return None
     with open(video_path, "wb") as file:
         file.write(content)
     return video_path
+
+
+def _is_valid_video_file_content(head: bytes, size: int) -> bool:
+    if size < 1024:
+        return False
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return True
+    if head[:4] == b"\x1aE\xdf\xa3":
+        return True
+    if head.startswith(b"RIFF") and b"AVI" in head:
+        return True
+    return False
 
 
 def _encode_frame_jpeg(frame: Any) -> str | None:
@@ -554,7 +584,8 @@ def _extract_frames_with_ffmpeg(
 
 
 def download_as_data_url(session: requests.Session, url: str) -> str:
-    response = session.get(url, timeout=20)
+    headers = _media_request_headers(url)
+    response = session.get(url, timeout=20, headers=headers)
     response.raise_for_status()
 
     content = response.content
@@ -569,6 +600,71 @@ def download_as_data_url(session: requests.Session, url: str) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def _extract_frames_from_local_file(video_path: str, duration: int = 0) -> list[str]:
+    data_urls: list[str] = []
+    try:
+        import cv2
+    except ImportError:
+        cv2 = None  # type: ignore[assignment]
+
+    if cv2 is not None:
+        capture = cv2.VideoCapture(video_path)
+        if capture.isOpened():
+            total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+            if duration <= 0 and total_frames > 0 and fps > 0:
+                duration = int(total_frames / fps)
+            if total_frames > 1:
+                positions = [
+                    max(0, min(total_frames - 1, int(total_frames * ratio)))
+                    for ratio in _FRAME_RATIOS[:MAX_VIDEO_FRAMES]
+                ]
+            else:
+                positions = [0]
+            for frame_index in positions:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    continue
+                data_url = _encode_frame_jpeg(frame)
+                if data_url:
+                    data_urls.append(data_url)
+            capture.release()
+
+    if not data_urls and shutil.which("ffmpeg"):
+        for index, second in enumerate(_frame_seconds(duration)):
+            if index >= MAX_VIDEO_FRAMES:
+                break
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                frame_path = os.path.join(tmp_dir, f"frame_{index:02d}.jpg")
+                result = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        str(second),
+                        "-i",
+                        video_path,
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "2",
+                        frame_path,
+                    ],
+                    capture_output=True,
+                    check=False,
+                )
+                if result.returncode != 0 or not os.path.isfile(frame_path):
+                    continue
+                with open(frame_path, "rb") as file:
+                    encoded = base64.b64encode(file.read()).decode("ascii")
+                data_urls.append(f"data:image/jpeg;base64,{encoded}")
+
+    if data_urls:
+        logger.info("Кадры из локального видео: %d", len(data_urls))
+    return data_urls[:MAX_VIDEO_FRAMES]
+
+
 def _load_video_frames(
     session: requests.Session, vk: Any | None, message_data: dict[str, Any] | None
 ) -> list[str]:
@@ -576,13 +672,26 @@ def _load_video_frames(
     for video in get_video_items(message_data):
         detailed = _fetch_video_details(vk, video) if vk is not None else video
         duration = int(detailed.get("duration") or 0)
-        mp4 = _pick_mp4_url(detailed)
-
         frames: list[str] = []
-        if mp4:
-            frames = _extract_frames_with_opencv(session, mp4, duration)
-            if not frames:
-                frames = _extract_frames_with_ffmpeg(session, mp4, duration)
+
+        if vk is not None:
+            try:
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    video_path = download_video_file(session, vk, video, tmp_dir)
+                    frames = _extract_frames_from_local_file(video_path, duration)
+            except Exception:
+                logger.warning("Скачивание видео через video.get не удалось", exc_info=True)
+
+        if not frames:
+            for url in _collect_video_urls(detailed):
+                if ".m3u8" in url:
+                    continue
+                frames = _extract_frames_with_opencv(session, url, duration)
+                if frames:
+                    break
+                frames = _extract_frames_with_ffmpeg(session, url, duration)
+                if frames:
+                    break
 
         if frames:
             data_urls.extend(frames)
@@ -593,7 +702,7 @@ def _load_video_frames(
             try:
                 data_urls.append(download_as_data_url(session, url))
             except Exception:
-                logger.exception("Не удалось загрузить кадр видео: %s", url[:80])
+                logger.warning("Не удалось загрузить превью видео: %s", url[:80])
             if len(data_urls) >= MAX_VIDEO_FRAMES:
                 break
 

@@ -216,7 +216,19 @@ def format_models_list(text_model: str, vision_model: str) -> str:
 
 
 def format_invalid_model(name: str) -> str:
+    token = name.strip()
+    lower = token.casefold()
+    text_match = next((mid for mid, _ in TEXT_MODELS if mid.casefold() == lower), None)
+    vision_match = next((mid for mid, _ in VISION_MODELS if mid.casefold() == lower), None)
+
+    if text_match and text_match not in {mid for mid, _ in VISION_MODELS}:
+        return (
+            f"«{token}» — только для текста, фото/видео ею не разберёшь.\n"
+            f"Текст: /ии текст {text_match}\n"
+            "Фото: /ии фото gemini-2.5-flash или /ии фото gpt-4o"
+        )
+
     return (
-        f"Модель «{name}» не в списке.\n"
+        f"Модель «{token}» не в списке.\n"
         "Напиши /ии список — там все доступные варианты."
     )

@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -15,6 +17,56 @@ from vk_api.utils import get_random_id
 from ai_client import format_bot_message
 
 logger = logging.getLogger(__name__)
+
+_PHOTO_MIME = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+
+def _photo_attachment(photo: dict[str, Any]) -> str:
+    owner_id = photo["owner_id"]
+    photo_id = photo["id"]
+    access_key = photo.get("access_key")
+    if access_key:
+        return f"photo{owner_id}_{photo_id}_{access_key}"
+    return f"photo{owner_id}_{photo_id}"
+
+
+def _upload_message_photo(vk: Any, temp_path: str, peer_id: int, *, attempts: int = 3) -> dict[str, Any]:
+    """Загрузка картинки в messages через photos.getMessagesUploadServer."""
+    ext = Path(temp_path).suffix.lstrip(".").lower() or "png"
+    mime = _PHOTO_MIME.get(ext, "image/png")
+
+    last_error = "неизвестная ошибка загрузки"
+    session = requests.Session()
+    for attempt in range(max(1, attempts)):
+        upload_url = vk.photos.getMessagesUploadServer(peer_id=peer_id)["upload_url"]
+        with open(temp_path, "rb") as photo_file:
+            response = session.post(
+                upload_url,
+                files={"photo": (f"image.{ext}", photo_file, mime)},
+                timeout=90,
+            )
+        if response.status_code >= 500:
+            last_error = f"HTTP {response.status_code} от upload-сервера VK"
+            if attempt + 1 < attempts:
+                time.sleep(1.5)
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            last_error = f"upload-сервер вернул не JSON: {response.text[:160]!r}"
+            continue
+        if not payload.get("photo"):
+            last_error = f"upload-сервер без photo: {payload!r}"
+            continue
+        saved = vk.photos.saveMessagesPhoto(**payload)
+        return saved[0] if isinstance(saved, list) else saved
+
+    raise RuntimeError(last_error)
 
 
 def build_reply_params(
@@ -66,17 +118,22 @@ def send_image_bytes(
     image_bytes: bytes,
     *,
     caption: str = "",
-    suffix: str = ".jpg",
+    suffix: str = ".png",
     reply_to_cmid: int | None = None,
     as_document: bool = False,
+    photo_only: bool = False,
 ) -> None:
     if not image_bytes:
         raise RuntimeError("Пустой файл картинки")
 
     ext = suffix if suffix.startswith(".") else f".{suffix}"
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as temp_file:
-        temp_file.write(image_bytes)
-        temp_path = temp_file.name
+    fd, temp_path = tempfile.mkstemp(suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as temp_file:
+            temp_file.write(image_bytes)
+    except Exception:
+        os.unlink(temp_path)
+        raise
 
     try:
         uploader = VkUpload(vk_session)
@@ -85,11 +142,21 @@ def send_image_bytes(
 
         if use_photo:
             try:
-                photos = uploader.photo_messages(temp_path, peer_id=peer_id)
-                photo = photos[0] if isinstance(photos, list) else photos
-                attachment = f"photo{photo['owner_id']}_{photo['id']}"
-            except Exception:
-                logger.exception("photo_messages не удался, пробую doc peer_id=%s", peer_id)
+                photo = _upload_message_photo(
+                    vk,
+                    temp_path,
+                    peer_id,
+                    attempts=3 if photo_only else 2,
+                )
+                attachment = _photo_attachment(photo)
+            except Exception as exc:
+                if photo_only:
+                    raise RuntimeError(f"Не удалось отправить фото: {exc}") from exc
+                logger.warning(
+                    "photo_messages не удался (%s), пробую doc peer_id=%s",
+                    exc,
+                    peer_id,
+                )
                 document = uploader.document_message(
                     temp_path,
                     peer_id=peer_id,

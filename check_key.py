@@ -18,8 +18,7 @@ def decode_jwt_payload(token: str) -> dict:
     return json.loads(base64.urlsafe_b64decode(payload))
 
 
-def probe_bothub(token: str) -> tuple[int, str]:
-    req = urllib.request.Request(
+def probe_bothub(token: str) -> import tye vkai   req = urllib.request.Request(
         f"{BASE_URL}/models",
         headers={"Authorization": f"Bearer {token}"},
     )

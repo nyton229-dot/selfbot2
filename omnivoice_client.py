@@ -27,6 +27,15 @@ def _pick_device() -> str:
     return "cpu"
 
 
+def is_omnivoice_ready(model_id: str | None = None) -> bool:
+    """Модель уже в памяти — без многогигабайтной загрузки при первом голосовом."""
+    if _model is None:
+        return False
+    if model_id is None:
+        return True
+    return _model_id == model_id
+
+
 def _load_model(model_id: str) -> Any:
     global _model, _model_id
     with _lock:

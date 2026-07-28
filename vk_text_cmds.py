@@ -1,4 +1,4 @@
-"""«артем кратко», «артем спорь», «артем нарисуй», «артем гиф», «артем мем», «артем цитата»."""
+"""«артем кратко», «артем обоснуй», «артем спорь», «артем нарисуй», «артем гиф», «артем мем», «артем цитата»."""
 
 from __future__ import annotations
 
@@ -6,6 +6,10 @@ import re
 from dataclasses import dataclass
 
 _KRATKO_RE = re.compile(r"^кратко(?:\s+(?P<extra>.+))?$", re.IGNORECASE | re.DOTALL)
+_OBOSNUJ_RE = re.compile(
+    r"^обосну(?:й|и)?(?:\s+(?P<extra>.+))?$",
+    re.IGNORECASE | re.DOTALL,
+)
 _SPOR_RE = re.compile(r"^спорь(?:\s+(?P<extra>.+))?$", re.IGNORECASE | re.DOTALL)
 _TTS_WORD_RE = re.compile(r"\bозвучь\b", re.IGNORECASE)
 _NARISUY_RE = re.compile(
@@ -29,6 +33,11 @@ _SPOR_MODE_HINT = (
 
 @dataclass(frozen=True)
 class KratkoCommand:
+    extra: str = ""
+
+
+@dataclass(frozen=True)
+class ObosnujCommand:
     extra: str = ""
 
 
@@ -66,6 +75,16 @@ def parse_kratko_command(prompt: str) -> KratkoCommand | None:
     if not match:
         return None
     return KratkoCommand(extra=(match.group("extra") or "").strip())
+
+
+def parse_obosnuj_command(prompt: str) -> ObosnujCommand | None:
+    stripped = prompt.strip()
+    if not stripped:
+        return None
+    match = _OBOSNUJ_RE.match(stripped)
+    if not match:
+        return None
+    return ObosnujCommand(extra=(match.group("extra") or "").strip())
 
 
 def parse_spor_command(prompt: str) -> SporCommand | None:
@@ -174,6 +193,20 @@ def build_kratko_prompt(source_text: str, extra: str = "") -> str:
         f"Потом одна короткая колкость в стиле Артёма.\n\n"
         f"Текст для пересказа:\n{source_text}"
     )
+
+
+def build_obosnuj_prompt(source_text: str, extra: str = "") -> str:
+    focus = f" Акцент: {extra}." if extra else ""
+    return (
+        f"Разверни и обоснуй подробнее — 4–6 законченных предложений, аргументы и детали.{focus} "
+        f"Не обрывай на одной короткой фразе.\n\n"
+        f"Текст для обоснования:\n{source_text}"
+    )
+
+
+def build_obosnuj_photo_prompt(extra: str = "") -> str:
+    focus = f" {extra.strip()}" if extra.strip() else ""
+    return f"Обоснуй подробнее что на кадре — 4–6 предложений, разверни аргументы.{focus}".strip()
 
 
 def strip_tts_keyword(prompt: str) -> str:

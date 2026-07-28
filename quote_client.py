@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from meme_client import download_image_bytes
 from vk_avatar import fetch_user_avatar
@@ -50,15 +50,35 @@ _FONT_TINY = (
     Path("C:/Windows/Fonts/cour.ttf"),
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"),
 )
+_FONT_IOS = (
+    Path("C:/Windows/Fonts/segoeuib.ttf"),
+    Path("C:/Windows/Fonts/segoeui.ttf"),
+    Path("C:/Windows/Fonts/arialbd.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+)
+_FONT_IOS_CAPTION = (
+    Path("C:/Windows/Fonts/segoeui.ttf"),
+    Path("C:/Windows/Fonts/arial.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+)
+
+_IOS_BG = (242, 242, 247)
+_IOS_CARD = (255, 255, 255)
+_IOS_TEXT = (28, 28, 30)
+_IOS_SECONDARY = (142, 142, 147)
+_IOS_QUOTE_MARK = (209, 209, 214)
 
 _BOT_TEXT_RE = re.compile(
     r"^(?:"
     r"артем\s+)?(?:"
     r"цитата|цитату|quote|гиф|gif|мем|нарисуй|кратко|спорь|"
-    r"озвучь|голос|ответь|reply"
+    r"озвучь|голос|ответь|reply|/цит|/cit"
     r")(?:\s|$)",
     re.IGNORECASE,
 )
+
+_CIT_COMMAND_RE = re.compile(r"^/цит(?:ата)?(?:\s+(?P<style>.+))?$", re.IGNORECASE | re.DOTALL)
+_CIT_ALT_RE = re.compile(r"^/cit(?:\s+(?P<style>.+))?$", re.IGNORECASE | re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -69,6 +89,26 @@ class QuoteCard:
     user_id: int
     message_ts: int
     avatar_bytes: bytes | None = None
+
+
+@dataclass(frozen=True)
+class CitCommand:
+    style: str = ""
+
+
+def is_cit_command(text: str) -> bool:
+    return parse_cit_command(text) is not None
+
+
+def parse_cit_command(text: str) -> CitCommand | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    for pattern in (_CIT_COMMAND_RE, _CIT_ALT_RE):
+        match = pattern.match(stripped)
+        if match is not None:
+            return CitCommand(style=(match.group("style") or "").strip())
+    return None
 
 
 def _font(paths: tuple[Path, ...], size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -255,6 +295,120 @@ def _paste_rotated(
     ImageDraw.Draw(pad).text((0, 0), text, font=font, fill=(*fill, 255))
     rotated = pad.rotate(90, expand=True)
     base.paste(rotated, anchor_xy, rotated)
+
+
+def _fit_ios_font(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_w: int,
+    max_h: int,
+) -> tuple[ImageFont.ImageFont, list[str]]:
+    for size in range(34, 16, -2):
+        font = _font(_FONT_IOS, size)
+        lines = _wrap_plain(text, font, max_w, draw)
+        body = "\n".join(lines)
+        bbox = draw.multiline_textbbox((0, 0), body, font=font, spacing=14, align="center")
+        if bbox[2] - bbox[0] <= max_w and bbox[3] - bbox[1] <= max_h:
+            return font, lines
+    font = _font(_FONT_IOS, 16)
+    return font, _wrap_plain(text, font, max_w, draw)
+
+
+def render_classic_image(quote: QuoteCard) -> bytes:
+    """iOS-style: светлый фон, белая карточка, текст и автор по центру."""
+    width, height = 640, 480
+    card_margin = 36
+    card_pad = 44
+    radius = 28
+    av_size = 48
+
+    cx1, cy1 = card_margin, card_margin
+    cx2, cy2 = width - card_margin, height - card_margin
+    center_x = width // 2
+    card_mid_y = (cy1 + cy2) // 2
+
+    base = Image.new("RGBA", (width, height), (*_IOS_BG, 255))
+    shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (cx1 + 2, cy1 + 6, cx2 + 2, cy2 + 6),
+        radius=radius,
+        fill=(0, 0, 0, 65),
+    )
+    base = Image.alpha_composite(base, shadow.filter(ImageFilter.GaussianBlur(radius=10)))
+
+    card_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(card_layer).rounded_rectangle(
+        (cx1, cy1, cx2, cy2),
+        radius=radius,
+        fill=(*_IOS_CARD, 255),
+    )
+    base = Image.alpha_composite(base, card_layer)
+    draw = ImageDraw.Draw(base)
+
+    inner_w = cx2 - cx1 - 2 * card_pad
+    inner_h = cy2 - cy1 - 2 * card_pad
+    author_font = _font(_FONT_IOS_CAPTION, 17)
+    name = quote.author_name.strip() or f"ID{quote.user_id}"
+    author_bbox = draw.textbbox((0, 0), name, font=author_font)
+    author_h = author_bbox[3] - author_bbox[1]
+    footer_h = author_h + 14
+    if quote.avatar_bytes:
+        footer_h += av_size + 12
+
+    quote_font, lines = _fit_ios_font(
+        draw,
+        quote.text,
+        inner_w,
+        max(inner_h - footer_h - 36, 80),
+    )
+    body = "\n".join(lines)
+    quote_bbox = draw.multiline_textbbox((0, 0), body, font=quote_font, spacing=14, align="center")
+    quote_h = quote_bbox[3] - quote_bbox[1]
+    mark_font = _font(_FONT_IOS, 56)
+    mark_h = draw.textbbox((0, 0), "\u201c", font=mark_font)[3]
+
+    block_h = mark_h + quote_h + footer_h
+    block_top = card_mid_y - block_h // 2
+
+    draw.text(
+        (center_x, block_top),
+        "\u201c",
+        font=mark_font,
+        fill=_IOS_QUOTE_MARK,
+        anchor="mt",
+    )
+
+    quote_y = block_top + mark_h + quote_h // 2
+    draw.multiline_text(
+        (center_x, quote_y),
+        body,
+        font=quote_font,
+        fill=_IOS_TEXT,
+        spacing=14,
+        align="center",
+        anchor="mm",
+    )
+
+    footer_y = block_top + mark_h + quote_h + 10
+    if quote.avatar_bytes:
+        with Image.open(BytesIO(quote.avatar_bytes)) as raw:
+            avatar = _circle_avatar(raw, av_size)
+        av_x = center_x - av_size // 2
+        base.paste(avatar, (av_x, footer_y), avatar)
+        draw = ImageDraw.Draw(base)
+        footer_y += av_size + 10
+
+    draw.text(
+        (center_x, footer_y + author_h // 2),
+        name,
+        font=author_font,
+        fill=_IOS_SECONDARY,
+        anchor="mm",
+    )
+
+    buf = BytesIO()
+    base.convert("RGB").save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def render_petukh_image(quote: QuoteCard) -> bytes:
@@ -471,7 +625,9 @@ def render_minimal_image(quote: QuoteCard) -> bytes:
 
 def _normalize_style(style: str) -> str:
     token = style.strip().casefold()
-    if token in ("", "великие", "петух", "petukh", "studio", "classic", "классика"):
+    if token in ("классика", "classic", "class", "цит", "cit", "simple", "простая"):
+        return "classic"
+    if token in ("", "великие", "петух", "petukh", "studio"):
         return "petukh"
     if token in ("кибер", "cyber", "киберпанк", "profile"):
         return "cyber"
@@ -482,8 +638,14 @@ def _normalize_style(style: str) -> str:
     return "petukh"
 
 
+def quote_image_suffix(style: str) -> str:
+    return ".png"
+
+
 def render_quote_image(quote: QuoteCard, style: str = "") -> bytes:
     normalized = _normalize_style(style)
+    if normalized == "classic":
+        return render_classic_image(quote)
     if normalized == "cyber":
         return render_cyber_image(quote)
     if normalized == "neon":

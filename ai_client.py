@@ -366,15 +366,39 @@ def sanitize_ai_reply(text: str) -> str:
     return trim_incomplete_reply_tail(result.strip())
 
 
+_MAX_VISION_FRAMES = 2
+
+
+def _normalize_ai_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                chunks.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+        return "".join(chunks).strip()
+    return str(content).strip()
+
+
 _COMPLETE_REPLY_END_RE = re.compile(r'[.!?…»"\'\)]$')
 
 
 def trim_incomplete_reply_tail(text: str) -> str:
-    """Убирает оборванное последнее слово/предложение после лимита токенов."""
+    """Убирает оборванное последнее предложение, если ответ обрезан по max_tokens."""
     normalized = text.strip()
     if not normalized:
         return normalized
     if _COMPLETE_REPLY_END_RE.search(normalized):
+        return normalized
+    # Стиль без точек/запятых — не трогаем хвост по словам
+    if not re.search(r"[.!?…]", normalized):
         return normalized
 
     sentences = re.split(r"(?<=[.!?])\s+", normalized)
@@ -384,13 +408,6 @@ def trim_incomplete_reply_tail(text: str) -> str:
             logger.warning("Ответ оборван — оставлены только целые предложения")
             return head
 
-    if " " in normalized:
-        head, tail = normalized.rsplit(" ", 1)
-        if len(tail) < 8:
-            trimmed = head.strip()
-            if trimmed:
-                logger.warning("Ответ оборван на «%s» — обрезан хвост", tail)
-                return trimmed
     return normalized
 
 
@@ -726,6 +743,14 @@ class AiClient:
     def _has_custom_vision_prompt(self) -> bool:
         return self._prompt_store is not None and bool(self._prompt_store.vision_prompt)
 
+    def _reply_max_tokens(self, user_text: str, *, has_images: bool) -> int:
+        cap = self._settings.ai_max_tokens
+        if user_requests_justify(user_text):
+            return min(cap, 900)
+        if has_images:
+            return min(cap, 700)
+        return min(cap, 450)
+
     @property
     def http_session(self) -> requests.Session:
         return self._session
@@ -933,9 +958,9 @@ class AiClient:
             )
         if video_transcript:
             chunks.append(f"Расшифровка речи из видео:\n{video_transcript}")
+        if user_requests_justify(user_text) and not (owner_trigger and owner_self_media):
+            chunks.append(_JUSTIFY_USER_HINT)
         if not custom_persona:
-            if user_requests_justify(user_text) and not (owner_trigger and owner_self_media):
-                chunks.append(_JUSTIFY_USER_HINT)
             if user_message_has_apology(user_text):
                 chunks.append(
                     "Собеседник извиняется — можешь чуть смягчиться, но остаёшься злым и грубым."
@@ -985,7 +1010,7 @@ class AiClient:
         reply_to_user: ReplyToUserContext | None = None,
     ) -> str | list[dict[str, Any]]:
         photo_count = len(photo_data_urls or [])
-        photo_vision_mode = bool(photo_data_urls)
+        photo_vision_mode = bool(photo_data_urls or video_data_urls)
         text = self._compose_user_text(
             user_text,
             chat_context,
@@ -1011,10 +1036,115 @@ class AiClient:
             if compare_photos and photo_count >= 2:
                 parts.append({"type": "text", "text": f"Фото {index}:"})
             parts.append({"type": "image_url", "image_url": {"url": data_url}})
-        for index, data_url in enumerate(video_data_urls or [], start=1):
+        for index, data_url in enumerate((video_data_urls or [])[:_MAX_VISION_FRAMES], start=1):
             parts.append({"type": "text", "text": f"Кадр видео {index}:"})
             parts.append({"type": "image_url", "image_url": {"url": data_url}})
         return parts
+
+    def _call_chat_with_fallback(
+        self,
+        user_text: str,
+        system_prompt: str,
+        photo_data_urls: list[str] | None,
+        video_data_urls: list[str] | None,
+        chat_context: str | None,
+        has_photos: bool,
+        has_video: bool,
+        media_context: str | None,
+        compare_photos: bool,
+        owner_trigger: bool,
+        roast_target: str | None,
+        owner_self_media: bool,
+        owner_names: tuple[str, ...],
+        video_transcript: str | None,
+        reply_to_user: ReplyToUserContext | None,
+    ) -> tuple[str, bool]:
+        limited_video = (video_data_urls or [])[:_MAX_VISION_FRAMES] or None
+        try:
+            return self._call_chat(
+                user_text,
+                system_prompt,
+                photo_data_urls,
+                limited_video,
+                chat_context,
+                has_photos,
+                has_video,
+                media_context,
+                compare_photos,
+                owner_trigger,
+                roast_target,
+                owner_self_media,
+                owner_names,
+                video_transcript,
+                reply_to_user,
+            )
+        except RuntimeError as exc:
+            if "пустой" not in str(exc).casefold():
+                raise
+            if limited_video and len(limited_video) > 1:
+                logger.warning("Пустой vision-ответ, повтор с 1 кадром видео")
+                return self._call_chat(
+                    user_text,
+                    system_prompt,
+                    photo_data_urls,
+                    limited_video[:1],
+                    chat_context,
+                    has_photos,
+                    has_video,
+                    media_context,
+                    compare_photos,
+                    owner_trigger,
+                    roast_target,
+                    owner_self_media,
+                    owner_names,
+                    video_transcript,
+                    reply_to_user,
+                )
+            if limited_video and photo_data_urls:
+                logger.warning("Пустой vision-ответ, повтор без кадров видео")
+                return self._call_chat(
+                    user_text,
+                    system_prompt,
+                    photo_data_urls,
+                    None,
+                    chat_context,
+                    has_photos,
+                    has_video,
+                    media_context,
+                    compare_photos,
+                    owner_trigger,
+                    roast_target,
+                    owner_self_media,
+                    owner_names,
+                    video_transcript,
+                    reply_to_user,
+                )
+            if limited_video or photo_data_urls:
+                logger.warning("Пустой vision-ответ, повтор текстом по метаданным")
+                meta = media_context or "Медиа приложено, но кадр не разобрать."
+                if video_transcript:
+                    meta = f"{meta}\n\nРасшифровка:\n{video_transcript}"
+                fallback_prompt = (
+                    f"{user_text}\n\nКадры недоступны. Ответь по описанию:\n{meta}"
+                )
+                return self._call_chat(
+                    fallback_prompt,
+                    system_prompt,
+                    None,
+                    None,
+                    chat_context,
+                    False,
+                    has_video,
+                    media_context,
+                    compare_photos,
+                    owner_trigger,
+                    roast_target,
+                    owner_self_media,
+                    owner_names,
+                    None,
+                    reply_to_user,
+                )
+            raise
 
     def _system_content(self, system_prompt: str | None = None) -> str:
         if system_prompt:
@@ -1087,9 +1217,9 @@ class AiClient:
         url = f"{self._settings.ai_base_url}/chat/completions"
         image_data_urls = list(photo_data_urls or []) + list(video_data_urls or [])
         model = self.vision_model if image_data_urls else self.text_model
-        temperature = 0.9
-        timeout = 75 if image_data_urls else 40
-        max_tokens = self._settings.ai_max_tokens
+        temperature = 0.85
+        timeout = 45 if image_data_urls else 22
+        max_tokens = self._reply_max_tokens(user_text, has_images=bool(image_data_urls))
         payload: dict[str, Any] = {
             "model": model,
             "temperature": temperature,
@@ -1124,7 +1254,7 @@ class AiClient:
 
         try:
             choice = data["choices"][0]
-            content = choice["message"]["content"]
+            content = _normalize_ai_content(choice["message"].get("content"))
             finish_reason = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Неожиданный ответ AI API: {data}") from exc
@@ -1133,9 +1263,10 @@ class AiClient:
             logger.warning("AI обрезал ответ по max_tokens=%d", max_tokens)
 
         if not content:
+            logger.warning("AI API пустой content, finish_reason=%s model=%s", finish_reason, model)
             raise RuntimeError("AI API вернул пустой ответ")
 
-        raw = content.strip()
+        raw = content
         had_links = reply_contains_links(raw)
         cleaned = sanitize_ai_reply(raw)
         if not cleaned:
@@ -1164,6 +1295,8 @@ class AiClient:
         reply_to_user: ReplyToUserContext | None,
     ) -> str:
         if not (has_photos or has_video) or not owner_trigger:
+            return reply
+        if self._has_custom_vision_prompt():
             return reply
         if not looks_like_neutral_photo_caption(reply):
             return reply
@@ -1222,7 +1355,7 @@ class AiClient:
         reply = sanitize_ai_reply(reply)
         if reply_to_user is not None:
             reply = clean_reply_to_user_text(reply, reply_to_user)
-        photo_vision_mode = bool(photo_data_urls)
+        photo_vision_mode = bool(photo_data_urls or video_data_urls)
         if owner_trigger and (has_photos or has_video) and not photo_vision_mode:
             reply = self._enforce_photo_roast(
                 reply,
@@ -1263,7 +1396,7 @@ class AiClient:
         video_transcript: str | None = None,
         reply_to_user: ReplyToUserContext | None = None,
     ) -> str:
-        photo_vision_mode = bool(photo_data_urls)
+        photo_vision_mode = bool(photo_data_urls or video_data_urls)
         system_prompt = self._resolve_system_prompt(
             system_prompt,
             owner_trigger,
@@ -1272,8 +1405,7 @@ class AiClient:
             user_text,
             photo_vision_mode=photo_vision_mode,
         )
-        image_data_urls = list(photo_data_urls or []) + list(video_data_urls or [])
-        reply, had_links = self._call_chat(
+        reply, _had_links = self._call_chat_with_fallback(
             user_text,
             system_prompt,
             photo_data_urls,
@@ -1290,32 +1422,13 @@ class AiClient:
             video_transcript,
             reply_to_user,
         )
-        if had_links:
-            logger.warning("Перегенерирую ответ без ссылок")
-            link_retry_prompt = f"{system_prompt}\n\n{_LINK_RETRY_SUFFIX}"
-            retry_reply, retry_links = self._call_chat(
-                user_text,
-                link_retry_prompt,
-                photo_data_urls,
-                video_data_urls,
-                chat_context,
-                has_photos,
-                has_video,
-                media_context,
-                compare_photos,
-                owner_trigger,
-                roast_target,
-                owner_self_media,
-                owner_names,
-                video_transcript,
-                reply_to_user,
-            )
-            if retry_reply:
-                reply = retry_reply
-                had_links = retry_links
+        custom_persona = self._has_custom_text_prompt() or self._has_custom_vision_prompt()
         if not photo_vision_mode and owner_self_media:
             reply = clean_owner_self_media_reply(reply)
-            if reply_mentions_chat_roast(reply):
+            if (
+                not custom_persona
+                and reply_mentions_chat_roast(reply)
+            ):
                 logger.warning("Ответ про участников чата (%d симв.), перегенерирую", len(reply))
                 length_hint = (
                     "Повтор: 4–6 предложений, разверни обоснование про кадр, без * и без чата."
@@ -1359,7 +1472,8 @@ class AiClient:
                 reply_to_user,
             )
         if (
-            not photo_vision_mode
+            not custom_persona
+            and not photo_vision_mode
             and owner_trigger
             and owner_labels
             and reply_mentions_owner(reply, owner_labels, owner_names)
@@ -1422,7 +1536,7 @@ class AiClient:
                 video_transcript,
                 reply_to_user,
             )
-        if self._looks_like_refusal(reply):
+        if not custom_persona and self._looks_like_refusal(reply):
             logger.warning("AI отказ (%d симв.), повторяю запрос", len(reply))
             retry_prompt = f"{system_prompt}\n\n{_REFUSAL_RETRY_SUFFIX}"
             retry, _ = self._call_chat(
@@ -1489,7 +1603,7 @@ class AiClient:
                 video_transcript,
                 reply_to_user,
             )
-        if self._looks_like_bot_admission(reply):
+        if not custom_persona and self._looks_like_bot_admission(reply):
             logger.warning("AI признал себя ботом (%d симв.), перегенерирую", len(reply))
             retry_prompt = f"{system_prompt}\n\n{_BOT_ADMISSION_RETRY_SUFFIX}"
             retry, _ = self._call_chat(

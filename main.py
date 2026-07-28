@@ -57,7 +57,7 @@ from gif_client import search_gif
 from horde_client import generate_image as generate_horde_image
 from instance_lock import acquire_instance_lock, release_instance_lock
 from meme_client import build_meme
-from quote_client import build_quote_image
+from quote_client import build_quote_image, is_cit_command, parse_cit_command
 from tts_client import log_tts_startup, text_to_voice_file
 from tts_voices import (
     apply_voice_command,
@@ -94,11 +94,14 @@ from vk_text_cmds import (
     build_kratko_prompt,
     build_meme_caption,
     build_narisuy_caption,
+    build_obosnuj_photo_prompt,
+    build_obosnuj_prompt,
     build_spor_extra_instruction,
     parse_gif_command,
     parse_kratko_command,
     parse_meme_command,
     parse_narisuy_command,
+    parse_obosnuj_command,
     parse_quote_command,
     parse_spor_command,
     split_prompt_flags,
@@ -280,6 +283,15 @@ def should_queue_prompt_event(event: Any) -> bool:
     return is_prompt_command((event.text or "").strip())
 
 
+def should_queue_cit_event(event: Any) -> bool:
+    """Команда /цит — цитатник (reply на сообщение), только от владельца."""
+    if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
+        return False
+    if not event.from_me:
+        return False
+    return is_cit_command((event.text or "").strip())
+
+
 def should_queue_voice_event(event: Any) -> bool:
     """Команда /голос — смена голоса озвучки, только от владельца."""
     if event.type != VkEventType.MESSAGE_NEW or not event.from_chat:
@@ -372,6 +384,8 @@ def _handle_longpoll_event(
         kind = "ii"
     elif should_queue_prompt_event(event):
         kind = "prompt"
+    elif should_queue_cit_event(event):
+        kind = "cit"
     elif should_queue_voice_event(event):
         kind = "voice"
     elif should_queue_delete_event(event):
@@ -523,11 +537,6 @@ class VkDmBot:
         reply_user_id = reply_author_id(event)
         if reply_user_id and reply_user_id > 0 and reply_user_id != self._my_user_id:
             return self._resolve_roast_target_from_id(reply_user_id)
-
-        member = self._pick_chat_member_name(peer_id)
-        if member:
-            return member
-
         return "участника беседы"
 
     def _resolve_roast_target_from_id(self, user_id: int) -> str:
@@ -848,7 +857,7 @@ class VkDmBot:
             caption="",
             suffix=".png",
             reply_to_cmid=reply_to_cmid,
-            as_document=False,
+            photo_only=True,
         )
         logger.info("Цитата style=%r: %s — %r", style, quote.author_name[:40], quote.text[:60])
 
@@ -1108,6 +1117,51 @@ class VkDmBot:
 
         await asyncio.to_thread(self.reply, peer_id, report, event)
 
+    async def _handle_cit(self, event: Any) -> None:
+        peer_id = event.peer_id
+        chat_id = event.chat_id
+        text = (event.text or "").strip()
+        command = parse_cit_command(text)
+        if command is None:
+            return
+
+        message_data = _message_data(event)
+        reply_msg = get_reply_message(message_data)
+        if reply_msg is None:
+            logger.info("Цит /цит без reply chat_id=%s", chat_id)
+            await asyncio.to_thread(
+                self.reply,
+                peer_id,
+                "Ответь на сообщение с текстом и напиши «/цит».",
+                event,
+            )
+            return
+
+        style = command.style or "classic"
+        reply_to_cmid = reply_message_conversation_id(reply_msg)
+        logger.info("Обработка /цит chat_id=%s style=%r", chat_id, style)
+        try:
+            await asyncio.to_thread(self._set_typing, peer_id)
+            await asyncio.to_thread(
+                self._send_quote_reply,
+                peer_id,
+                event,
+                message_data,
+                reply_to_cmid=reply_to_cmid,
+                style=style,
+            )
+        except RuntimeError as exc:
+            logger.warning("Цитата /цит chat_id=%s: %s", chat_id, exc)
+            await asyncio.to_thread(self.reply, peer_id, str(exc), event)
+        except Exception:
+            logger.exception("Ошибка /цит chat_id=%s", chat_id)
+            await asyncio.to_thread(
+                self.reply,
+                peer_id,
+                "Не вышло сделать цитату — подожди и попробуй снова.",
+                event,
+            )
+
     async def _handle_voice(self, event: Any, *, prompt: str | None = None) -> None:
         peer_id = event.peer_id
         chat_id = event.chat_id
@@ -1300,12 +1354,14 @@ class VkDmBot:
             return
 
         kratko_cmd = parse_kratko_command(cleaned_prompt)
+        obosnuj_cmd = parse_obosnuj_command(cleaned_prompt)
         spor_cmd = parse_spor_command(cleaned_prompt)
         reply_cmd = parse_reply_to_user_command(cleaned_prompt)
         reply_to_user: ReplyToUserContext | None = None
         reply_to_cmid: int | None = None
         delete_owner_trigger = False
         ai_prompt = cleaned_prompt
+        media_message_data = message_data
 
         if kratko_cmd is not None:
             reply_msg = get_reply_message(message_data)
@@ -1323,6 +1379,35 @@ class VkDmBot:
                 kratko_cmd.extra,
             )
             logger.info("Режим кратко chat_id=%s source=%r", chat_id, reply_message_text(reply_msg)[:80])
+        elif obosnuj_cmd is not None:
+            reply_msg = get_reply_message(message_data)
+            has_current_media = media_in_current_message(message_data)
+            if reply_msg is not None:
+                source_text = reply_message_text(reply_msg).strip()
+                if source_text:
+                    ai_prompt = build_obosnuj_prompt(source_text, obosnuj_cmd.extra)
+                else:
+                    ai_prompt = build_obosnuj_photo_prompt(obosnuj_cmd.extra)
+                if not has_current_media and message_has_media(reply_msg):
+                    media_message_data = reply_msg
+                logger.info(
+                    "Режим обоснуй chat_id=%s source=%r media_from_reply=%s",
+                    chat_id,
+                    source_text[:80] if source_text else "[фото]",
+                    media_message_data is reply_msg,
+                )
+            elif has_current_media:
+                ai_prompt = build_obosnuj_photo_prompt(obosnuj_cmd.extra)
+                logger.info("Режим обоснуй chat_id=%s (фото в сообщении)", chat_id)
+            else:
+                logger.info("Обоснуй без reply и без медиа chat_id=%s", chat_id)
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    "Ответь на сообщение или приложи фото, потом «артем обоснуй».",
+                    event,
+                )
+                return
         elif spor_cmd is not None:
             reply_to_user = self._build_reply_to_user_context(
                 event,
@@ -1397,21 +1482,26 @@ class VkDmBot:
             await asyncio.to_thread(self._delete_trigger_message, peer_id, event)
 
         try:
-            await asyncio.to_thread(self._set_typing, peer_id)
-
             owner_self_media = outgoing_trigger and (
-                media_in_current_message(message_data) or media_is_self_upload(message_data)
+                media_in_current_message(media_message_data)
+                or media_is_self_upload(media_message_data)
             )
-            need_roast = outgoing_trigger and not owner_self_media and reply_to_user is None
+            need_roast = (
+                outgoing_trigger
+                and not owner_self_media
+                and reply_to_user is None
+                and self._prompts.text_prompt is None
+            )
             need_transcript = has_videos and should_transcribe_video(
                 ai_prompt,
                 mode=self._settings.transcribe_video,
             )
 
+            typing_task = asyncio.to_thread(self._set_typing, peer_id)
             media_task = asyncio.to_thread(
                 load_message_images,
                 self._vk_session.http,
-                message_data,
+                media_message_data,
                 self._vk,
             )
             transcript_task = (
@@ -1434,15 +1524,34 @@ class VkDmBot:
             )
 
             (
+                _typing,
                 (photo_data_urls, video_data_urls, has_photos, has_video, media_context),
                 video_transcript,
                 roast_target,
-            ) = await asyncio.gather(media_task, transcript_task, roast_task)
+            ) = await asyncio.gather(typing_task, media_task, transcript_task, roast_task)
             if outgoing_trigger:
                 media_context = sanitize_media_context_for_owner(media_context, self._owner_names)
             image_count = len(photo_data_urls) + len(video_data_urls)
             wants_compare = wants_photo_compare(prompt, count_photos(message_data))
-            if has_media and not image_count:
+            video_text_fallback = False
+            if has_media and not image_count and has_videos:
+                if not video_transcript:
+                    video_transcript = await asyncio.to_thread(
+                        transcribe_videos_in_message,
+                        self._vk_session.http,
+                        self._vk,
+                        media_message_data,
+                        api_key=self._settings.ai_api_key,
+                        base_url=self._settings.ai_base_url,
+                        model=self._settings.ai_whisper_model,
+                    )
+                video_text_fallback = bool(video_transcript or media_context)
+                if video_text_fallback:
+                    logger.info(
+                        "Видео без кадров — ответ по расшифровке/метаданным (transcript=%s)",
+                        "да" if video_transcript else "нет",
+                    )
+            if has_media and not image_count and not video_text_fallback:
                 reply = (
                     "Не смог открыть фото или видео из сообщения."
                     if outgoing_trigger
@@ -1473,6 +1582,7 @@ class VkDmBot:
                         owner_self_media,
                         "" if owner_self_media else f" roast_target={roast_target!r}",
                     )
+                logger.info("Запрос к AI chat_id=%s: %r", chat_id, ai_prompt[:100])
                 reply = await self._ai.generate_reply(
                     ai_prompt,
                     photo_data_urls=photo_data_urls or None,
@@ -1490,12 +1600,31 @@ class VkDmBot:
                     video_transcript=video_transcript,
                     reply_to_user=reply_to_user,
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("Ошибка AI API для user_id=%s", user_id)
-            reply = "Сейчас не отвечаю — не трать моё и своё время."
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                status = exc.response.status_code
+                reply = f"ИИ не ответил (HTTP {status}). Проверь BOTHUB_API_KEY и модель в /ии."
+            elif isinstance(exc, RuntimeError):
+                reply = f"ИИ не ответил: {exc}"
+            else:
+                reply = "Сейчас не отвечаю — не трать моё и своё время."
 
         try:
             if want_tts:
+                await asyncio.to_thread(
+                    self.reply,
+                    peer_id,
+                    reply,
+                    event,
+                    reply_to_cmid=reply_to_cmid,
+                )
+                logger.info(
+                    "Reply отправлен в беседу chat_id=%s (%d символов)%s",
+                    chat_id,
+                    len(reply),
+                    f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
+                )
                 try:
                     await asyncio.to_thread(
                         self._send_voice_reply,
@@ -1511,20 +1640,7 @@ class VkDmBot:
                         f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
                     )
                 except Exception:
-                    logger.exception("TTS не сработал chat_id=%s, отправляю текстом", chat_id)
-                    await asyncio.to_thread(
-                        self.reply,
-                        peer_id,
-                        reply,
-                        event,
-                        reply_to_cmid=reply_to_cmid,
-                    )
-                    logger.info(
-                        "Reply отправлен в беседу chat_id=%s (%d символов)%s",
-                        chat_id,
-                        len(reply),
-                        f" -> cmid={reply_to_cmid}" if reply_to_cmid else "",
-                    )
+                    logger.exception("TTS не сработал chat_id=%s (текст уже отправлен)", chat_id)
             else:
                 await asyncio.to_thread(
                     self.reply,
@@ -1595,6 +1711,8 @@ class VkDmBot:
                 await self._handle_ii(event)
             elif kind == "prompt":
                 await self._handle_prompt(event)
+            elif kind == "cit":
+                await self._handle_cit(event)
             elif kind == "voice":
                 await self._handle_voice(event)
             elif kind == "delete":

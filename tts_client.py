@@ -434,18 +434,34 @@ def text_to_voice_file(
     mode = (tts_provider or "auto").strip().lower()
 
     if mode == "omnivoice":
-        from omnivoice_client import synthesize_omnivoice_wav
+        try:
+            from omnivoice_client import is_omnivoice_ready, synthesize_omnivoice_wav
 
-        wav_data = synthesize_omnivoice_wav(
-            speech_text,
-            model_id=omnivoice_model,
-            voice_id=voice,
-            instruct=omnivoice_instruct,
-            ref_audio=omnivoice_ref_audio,
-            ref_text=omnivoice_ref_text,
-            language=omnivoice_language,
-        )
-        return wav_bytes_to_voice_ogg(wav_data), "omnivoice"
+            if not is_omnivoice_ready(omnivoice_model):
+                logger.warning(
+                    "OmniVoice не загружена (~3 GB) — озвучка через edge-tts. "
+                    "Для OmniVoice: AI_TTS_PROVIDER=omnivoice и дождись загрузки, "
+                    "или OMNIVOICE_PRELOAD=1 при старте."
+                )
+                mp3_data = synthesize_edge_speech(speech_text, voice)
+                return mp3_bytes_to_voice_ogg(mp3_data), "edge-tts"
+
+            wav_data = synthesize_omnivoice_wav(
+                speech_text,
+                model_id=omnivoice_model,
+                voice_id=voice,
+                instruct=omnivoice_instruct,
+                ref_audio=omnivoice_ref_audio,
+                ref_text=omnivoice_ref_text,
+                language=omnivoice_language,
+            )
+            return wav_bytes_to_voice_ogg(wav_data), "omnivoice"
+        except Exception as exc:
+            if not allow_edge_fallback:
+                raise
+            logger.warning("OmniVoice не сработала (%s), пробую edge-tts", exc)
+            mp3_data = synthesize_edge_speech(speech_text, voice)
+            return mp3_bytes_to_voice_ogg(mp3_data), "edge-tts"
 
     mp3_data: bytes
     provider = "edge-tts"
